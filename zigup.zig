@@ -55,68 +55,26 @@ const DownloadResult = union(enum) {
         }
     }
 };
-fn download(allocator: Allocator, url: []const u8, writer: anytype) DownloadResult {
-    const uri = std.Uri.parse(url) catch |err| return .{ .err = std.fmt.allocPrint(
-        allocator,
-        "the URL is invalid ({s})",
-        .{@errorName(err)},
-    ) catch |e| oom(e) };
-
+fn download(allocator: Allocator, url: []const u8, writer: *std.Io.Writer) DownloadResult {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    client.initDefaultProxies(allocator) catch |err| return .{ .err = std.fmt.allocPrint(
-        allocator,
-        "failed to query the HTTP proxy settings with {s}",
-        .{@errorName(err)},
-    ) catch |e| oom(e) };
-
-    var header_buffer: [4096]u8 = undefined;
-    var request = client.open(.GET, uri, .{
-        .server_header_buffer = &header_buffer,
-        .keep_alive = false,
+    var fetch_result = client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = writer,
     }) catch |err| return .{ .err = std.fmt.allocPrint(
         allocator,
-        "failed to connect to the HTTP server with {s}",
-        .{@errorName(err)},
+        "failed to download '{s}' with {s}",
+        .{ url, @errorName(err) },
     ) catch |e| oom(e) };
 
-    defer request.deinit();
-
-    request.send() catch |err| return .{ .err = std.fmt.allocPrint(
-        allocator,
-        "failed to send the HTTP request with {s}",
-        .{@errorName(err)},
-    ) catch |e| oom(e) };
-    request.wait() catch |err| return .{ .err = std.fmt.allocPrint(
-        allocator,
-        "failed to read the HTTP response headers with {s}",
-        .{@errorName(err)},
-    ) catch |e| oom(e) };
-
-    if (request.response.status != .ok) return .{ .err = std.fmt.allocPrint(
+    if (fetch_result.status != .ok) return .{ .err = std.fmt.allocPrint(
         allocator,
         "the HTTP server replied with unsuccessful response '{d} {s}'",
-        .{ @intFromEnum(request.response.status), request.response.status.phrase() orelse "" },
+        .{ @intFromEnum(fetch_result.status), fetch_result.status.phrase() orelse "" },
     ) catch |e| oom(e) };
 
-    // TODO: we take advantage of request.response.content_length
-
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const len = request.reader().read(&buf) catch |err| return .{ .err = std.fmt.allocPrint(
-            allocator,
-            "failed to read the HTTP response body with {s}'",
-            .{@errorName(err)},
-        ) catch |e| oom(e) };
-        if (len == 0)
-            return .ok;
-        writer.writeAll(buf[0..len]) catch |err| return .{ .err = std.fmt.allocPrint(
-            allocator,
-            "failed to write the HTTP response body with {s}'",
-            .{@errorName(err)},
-        ) catch |e| oom(e) };
-    }
+    return .ok;
 }
 
 const DownloadStringResult = union(enum) {
@@ -124,10 +82,10 @@ const DownloadStringResult = union(enum) {
     err: []u8,
 };
 fn downloadToString(allocator: Allocator, url: []const u8) DownloadStringResult {
-    var response_array_list = ArrayList(u8).initCapacity(allocator, 50 * 1024) catch |e| oom(e); // 50 KB (modify if response is expected to be bigger)
-    defer response_array_list.deinit();
-    switch (download(allocator, url, response_array_list.writer())) {
-        .ok => return .{ .ok = response_array_list.toOwnedSlice() catch |e| oom(e) },
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    switch (download(allocator, url, &aw.writer)) {
+        .ok => return .{ .ok = aw.toOwnedSlice() catch |e| oom(e) },
         .err => |e| return .{ .err = e },
     }
 }
@@ -215,9 +173,11 @@ fn saveInstallDir(allocator: Allocator, maybe_dir: ?[]const u8) !void {
         if (std.fs.path.dirname(setting_path)) |dir| try std.fs.cwd().makePath(dir);
 
         {
-            const file = try std.fs.cwd().createFile(setting_path, .{});
+            var file = try std.fs.cwd().createFile(setting_path, .{});
             defer file.close();
-            try file.writer().writeAll(d);
+            var fw = file.writer(&.{});
+            try fw.interface.writeAll(d);
+            try fw.interface.flush();
         }
 
         // sanity check, read it back
@@ -310,7 +270,7 @@ fn help(allocator: Allocator) !void {
         break :blk "unavailable";
     };
 
-    try std.io.getStdErr().writer().print(
+    std.debug.print(
         \\Download and manage zig compilers.
         \\
         \\Common Usage:
@@ -323,6 +283,15 @@ fn help(allocator: Allocator) !void {
         \\                                that aren't the default, master, or marked to keep.
         \\  zigup keep VERSION            mark a compiler to be kept during clean
         \\  zigup run VERSION ARGS...     run the given VERSION of the compiler with the given ARGS...
+        \\
+        \\Lanes (multiple named compiler lines on one machine):
+        \\
+        \\  zigup lane set <name> <dir>   register lane <name> backed by a toolchain dir
+        \\  zigup lane list               list lanes and the default
+        \\  zigup lane default [name]     get or set the default lane
+        \\  zigup lane remove <name>      remove a lane
+        \\  zigup lane shim <name>...     install lane shims (incl. `zig`) next to zigup
+        \\                                resolution: $ZIGUP_LANE > ./.ziglane > default lane
         \\
         \\  zigup get-install-dir         prints the install directory to stdout
         \\  zigup set-install-dir [PATH]  set the default install directory, omitting the PATH reverts to the builtin default
@@ -376,6 +345,9 @@ pub fn main2() !u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const allocator = arena.allocator();
 
+    // lane shims (zig, zig_ccached, vigz, ...) dispatch before CLI parsing
+    if (try @import("lanes.zig").shimDispatch(allocator)) |code| return code;
+
     const args_array = try std.process.argsAlloc(allocator);
     // no need to free, os will do it
     //defer std.process.argsFree(allocator, argsArray);
@@ -422,6 +394,27 @@ pub fn main2() !u8 {
         try help(allocator);
         return 1;
     }
+    // lane management subcommands
+    const lanes_mod = @import("lanes.zig");
+    if (std.mem.eql(u8, "lane", args[0])) {
+        if (args.len >= 3 and std.mem.eql(u8, args[1], "set")) {
+            return try lanes_mod.laneSet(allocator, args[2], args[3]);
+        }
+        if (args.len == 3 and std.mem.eql(u8, args[1], "remove")) {
+            return try lanes_mod.laneRemove(allocator, args[2]);
+        }
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "list")) {
+            return try lanes_mod.laneList(allocator);
+        }
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "default")) {
+            return try lanes_mod.laneDefault(allocator, if (args.len >= 3) args[2] else null);
+        }
+        if (args.len >= 3 and std.mem.eql(u8, args[1], "shim")) {
+            return try lanes_mod.shimInstall(allocator, args[2..]);
+        }
+        std.log.err("usage: zigup lane set <name> <dir> | lane remove <name> | lane list | lane default [name] | lane shim <name>...", .{});
+        return 1;
+    }
     if (std.mem.eql(u8, "get-install-dir", args[0])) {
         if (args.len != 1) {
             std.log.err("get-install-dir does not accept any cmdline arguments", .{});
@@ -431,8 +424,10 @@ pub fn main2() !u8 {
             error.AlreadyReported => return 1,
             else => |e| return e,
         };
-        try std.io.getStdOut().writer().writeAll(install_dir);
-        try std.io.getStdOut().writer().writeAll("\n");
+        var out_w = std.fs.File.stdout().writer(&.{});
+        try out_w.interface.writeAll(install_dir);
+        try out_w.interface.writeAll("\n");
+        try out_w.interface.flush();
         return 0;
     }
     if (std.mem.eql(u8, "set-install-dir", args[0])) {
@@ -461,7 +456,7 @@ pub fn main2() !u8 {
         }
         var download_index = try fetchDownloadIndex(allocator, index_url);
         defer download_index.deinit(allocator);
-        try std.io.getStdOut().writeAll(download_index.text);
+        try std.fs.File.stdout().writeAll(download_index.text);
         return 0;
     }
     if (std.mem.eql(u8, "fetch", args[0])) {
@@ -564,9 +559,9 @@ pub fn runCompiler(allocator: Allocator, args: []const []const u8) !u8 {
         return 1;
     }
 
-    var argv = std.ArrayList([]const u8).init(allocator);
-    try argv.append(try std.fs.path.join(allocator, &.{ compiler_dir, "files", comptime "zig" ++ builtin.target.exeFileExt() }));
-    try argv.appendSlice(args[1..]);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(allocator, try std.fs.path.join(allocator, &.{ compiler_dir, "files", comptime "zig" ++ builtin.target.exeFileExt() }));
+    try argv.appendSlice(allocator, args[1..]);
 
     // TODO: use "execve" if on linux
     var proc = std.process.Child.init(argv.items, allocator);
@@ -724,6 +719,7 @@ fn existsAbsolute(absolutePath: []const u8) !bool {
     std.fs.cwd().access(absolutePath, .{}) catch |e| switch (e) {
         error.FileNotFound => return false,
         error.PermissionDenied => return e,
+        error.AccessDenied => return e,
         error.InputOutput => return e,
         error.SystemResources => return e,
         error.SymLinkLoop => return e,
@@ -748,7 +744,7 @@ fn listCompilers(allocator: Allocator) !void {
     };
     defer install_dir.close();
 
-    const stdout = std.io.getStdOut().writer();
+    var stdout = std.fs.File.stdout().writer(&.{}).interface;
     {
         var it = install_dir.iterate();
         while (try it.next()) |entry| {
@@ -892,7 +888,7 @@ fn getMasterDir(allocator: Allocator, install_dir: *std.fs.Dir) !?[]const u8 {
 fn printDefaultCompiler(allocator: Allocator) !void {
     const default_compiler_opt = try getDefaultCompiler(allocator);
     defer if (default_compiler_opt) |default_compiler| allocator.free(default_compiler);
-    const stdout = std.io.getStdOut().writer();
+    var stdout = std.fs.File.stdout().writer(&.{}).interface;
     if (default_compiler_opt) |default_compiler| {
         try stdout.print("{s}\n", .{default_compiler});
     } else {
@@ -1160,6 +1156,26 @@ const Release = struct {
 // The Zig release where the OS-ARCH in the url was swapped to ARCH-OS
 const arch_os_swap_release: Release = .{ .major = 0, .minor = 14, .patch = 1 };
 
+fn BoundedArray(comptime T: type, comptime max: usize) type {
+    // ccached: BoundedArray was removed from the standard library; this
+    // shim covers the small subset zigup uses (buffer, len, slice, init).
+    return struct {
+        const Self = @This();
+        buffer: [max]T = undefined,
+        len: usize = 0,
+        pub fn init(l: usize) error{Overflow}!Self {
+            if (l > max) return error.Overflow;
+            return .{ .len = l };
+        }
+        pub fn slice(self: *Self) []T {
+            return self.buffer[0..self.len];
+        }
+        pub fn sliceConst(self: *const Self) []const T {
+            return self.buffer[0..self.len];
+        }
+    };
+}
+
 const SemanticVersion = struct {
     const max_pre = 50;
     const max_build = 50;
@@ -1168,12 +1184,12 @@ const SemanticVersion = struct {
     major: usize,
     minor: usize,
     patch: usize,
-    pre: ?std.BoundedArray(u8, max_pre),
-    build: ?std.BoundedArray(u8, max_build),
+    pre: ?BoundedArray(u8, max_pre),
+    build: ?BoundedArray(u8, max_build),
 
-    pub fn array(self: *const SemanticVersion) std.BoundedArray(u8, max_string) {
-        var result: std.BoundedArray(u8, max_string) = undefined;
-        const roundtrip = std.fmt.bufPrint(&result.buffer, "{}", .{self}) catch unreachable;
+    pub fn array(self: *const SemanticVersion) BoundedArray(u8, max_string) {
+        var result: BoundedArray(u8, max_string) = undefined;
+        const roundtrip = std.fmt.bufPrint(result.buffer[0..], "{f}", .{self}) catch unreachable;
         result.len = roundtrip.len;
         return result;
     }
@@ -1188,10 +1204,10 @@ const SemanticVersion = struct {
             .major = parsed.major,
             .minor = parsed.minor,
             .patch = parsed.patch,
-            .pre = if (parsed.pre) |pre| std.BoundedArray(u8, max_pre).init(pre.len) catch |e| switch (e) {
+            .pre = if (parsed.pre) |pre| BoundedArray(u8, max_pre).init(pre.len) catch |e| switch (e) {
                 error.Overflow => std.debug.panic("semantic version pre '{s}' is too long (max is {})", .{ pre, max_pre }),
             } else null,
-            .build = if (parsed.build) |build| std.BoundedArray(u8, max_build).init(build.len) catch |e| switch (e) {
+            .build = if (parsed.build) |build| BoundedArray(u8, max_build).init(build.len) catch |e| switch (e) {
                 error.Overflow => std.debug.panic("semantic version build '{s}' is too long (max is {})", .{ build, max_build }),
             } else null,
         };
@@ -1201,9 +1217,9 @@ const SemanticVersion = struct {
         {
             // sanity check, ensure format gives us the same string back we just parsed
             const roundtrip = result.array();
-            if (!std.mem.eql(u8, roundtrip.slice(), s)) std.debug.panic(
+            if (!std.mem.eql(u8, roundtrip.sliceConst(), s)) std.debug.panic(
                 "codebug parse/format version mismatch:\nparsed: '{s}'\nformat: '{s}'\n",
-                .{ s, roundtrip.slice() },
+                .{ s, roundtrip.sliceConst() },
             );
         }
 
@@ -1214,17 +1230,15 @@ const SemanticVersion = struct {
             .major = self.major,
             .minor = self.minor,
             .patch = self.patch,
-            .pre = if (self.pre) |*pre| pre.slice() else null,
-            .build = if (self.build) |*build| build.slice() else null,
+            .pre = if (self.pre) |*pre| pre.sliceConst() else null,
+            .build = if (self.build) |*build| build.sliceConst() else null,
         };
     }
     pub fn format(
         self: SemanticVersion,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
+        writer: *std.Io.Writer,
     ) !void {
-        try self.ref().format(fmt, options, writer);
+        try self.ref().format(writer);
     }
 };
 
@@ -1277,7 +1291,8 @@ fn installCompiler(allocator: Allocator, compiler_dir: []const u8, url: []const 
             // note: important to close the file before we handle errors below
             //       since it will delete the parent directory of this file
             defer file.close();
-            break :blk download(allocator, url, file.writer());
+            var fw = file.writer(&.{});
+            break :blk download(allocator, url, &fw.interface);
         }) {
             .ok => {},
             .err => |err| {

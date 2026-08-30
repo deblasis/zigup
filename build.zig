@@ -32,9 +32,11 @@ pub fn build(b: *std.Build) !void {
     {
         const unzip = b.addExecutable(.{
             .name = "unzip",
-            .root_source_file = b.path("unzip.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("unzip.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
         });
         const install = b.addInstallArtifact(unzip, .{});
         unzip_step.dependOn(&install.step);
@@ -47,9 +49,11 @@ pub fn build(b: *std.Build) !void {
     {
         const zip = b.addExecutable(.{
             .name = "zip",
-            .root_source_file = b.path("zip.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("zip.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
         });
         const install = b.addInstallArtifact(zip, .{});
         zip_step.dependOn(&install.step);
@@ -57,8 +61,10 @@ pub fn build(b: *std.Build) !void {
 
     const host_zip_exe = b.addExecutable(.{
         .name = "zip",
-        .root_source_file = b.path("zip.zig"),
-        .target = b.graph.host,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zip.zig"),
+            .target = b.graph.host,
+        }),
     });
 
     const ci_step = b.step("ci", "The build/test step to run on the CI");
@@ -72,15 +78,17 @@ pub fn build(b: *std.Build) !void {
 fn addZigupExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Mode,
+    optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
     const win32exelink_mod: ?*std.Build.Module = blk: {
         if (target.result.os.tag == .windows) {
             const exe = b.addExecutable(.{
                 .name = "win32exelink",
-                .root_source_file = b.path("win32exelink.zig"),
-                .target = target,
-                .optimize = optimize,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("win32exelink.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
             });
             break :blk b.createModule(.{
                 .root_source_file = exe.getEmittedBin(),
@@ -91,10 +99,12 @@ fn addZigupExe(
 
     const exe = b.addExecutable(.{
         .name = "zigup",
-        .root_source_file = b.path("zigup.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = true,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zigup.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = true,
+        }),
     });
 
     if (target.result.os.tag == .windows) {
@@ -214,8 +224,10 @@ fn addTests(
 ) void {
     const runtest_exe = b.addExecutable(.{
         .name = "runtest",
-        .root_source_file = b.path("runtest.zig"),
-        .target = target,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("runtest.zig"),
+            .target = target,
+        }),
     });
     const tests: Tests = .{
         .b = b,
