@@ -1,5 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const process = std.process;
+const Io = std.Io;
 
 const log = std.log.scoped(.zigexelink);
 
@@ -13,12 +15,16 @@ export var zig_exe_string: [exe_marker_len + std.fs.max_path_bytes + 1]u8 =
     ("!!!THIS MARKS THE zig_exe_string MEMORY!!#" ++ ([1]u8{0} ** (std.fs.max_path_bytes + 1))).*;
 
 const global = struct {
-    var child: std.process.Child = undefined;
-    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const arena = arena_instance.allocator();
+    var io: Io = undefined;
+    var child: ?process.Child = null;
 };
 
-pub fn main() !u8 {
+pub fn main(init: process.Init) !u8 {
+    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const arena = arena_instance.allocator();
+    const io = init.io;
+    global.io = io;
+
     // Sanity check that the exe_marker_len is right (note: not fullproof)
     std.debug.assert(zig_exe_string[exe_marker_len - 1] == '#');
     if (zig_exe_string[exe_marker_len] == 0) {
@@ -35,31 +41,58 @@ pub fn main() !u8 {
     }
     const zig_exe = zig_exe_string[exe_marker_len .. exe_marker_len + zig_exe_len :0];
 
-    const args = try std.process.argsAlloc(global.arena);
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "exelink")) {
-        try std.io.getStdOut().writer().writeAll(zig_exe);
+    var argv: std.ArrayList([]const u8) = .empty;
+    {
+        // NOTE: initAllocator is REQUIRED on Windows (plain .init
+        // compile-errors there).
+        var it = try process.Args.Iterator.initAllocator(init.minimal.args, arena);
+        var first = true;
+        while (it.next()) |a| {
+            if (first) {
+                first = false;
+                try argv.append(arena, zig_exe); // replace argv[0]
+                continue;
+            }
+            try argv.append(arena, a);
+        }
+    }
+
+    if (argv.items.len >= 2 and std.mem.eql(u8, argv.items[1], "exelink")) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var out_file = Io.File.stdout();
+        var w = out_file.writerStreaming(io, &buf);
+        try w.interface.writeAll(zig_exe);
+        try w.interface.flush();
         return 0;
     }
-    args[0] = zig_exe;
 
-    // NOTE: create the process.child before calling SetConsoleCtrlHandler because it uses it
-    global.child = std.process.Child.init(args, global.arena);
+    var child = process.spawn(io, .{
+        .argv = argv.items,
+        .environ_map = null,
+    }) catch |err| {
+        log.err("failed to spawn '{s}': {s}", .{ zig_exe, @errorName(err) });
+        return 0xff;
+    };
+
+    // NOTE: create the process before calling SetConsoleCtrlHandler because the handler uses it
+    global.child = child;
 
     if (0 == win32.SetConsoleCtrlHandler(consoleCtrlHandler, 1)) {
         log.err("SetConsoleCtrlHandler failed, error={}", .{@intFromEnum(win32.GetLastError())});
         return 0xff; // fail
     }
 
-    try global.child.spawn();
-    return switch (try global.child.wait()) {
-        .Exited => |e| e,
-        .Signal => 0xff,
-        .Stopped => 0xff,
-        .Unknown => 0xff,
+    const term = child.wait(io) catch |err| {
+        log.err("failed waiting on '{s}': {s}", .{ zig_exe, @errorName(err) });
+        return 0xff;
+    };
+    return switch (term) {
+        .exited => |e| e,
+        else => 0xff,
     };
 }
 
-fn consoleCtrlHandler(ctrl_type: u32) callconv(@import("std").os.windows.WINAPI) win32.BOOL {
+fn consoleCtrlHandler(ctrl_type: u32) callconv(.c) win32.BOOL {
     //
     // NOTE: Do I need to synchronize this with the main thread?
     //
@@ -73,19 +106,11 @@ fn consoleCtrlHandler(ctrl_type: u32) callconv(@import("std").os.windows.WINAPI)
     };
     // TODO: should we stop the process on a break event?
     log.info("caught ctrl signal {d} ({s}), stopping process...", .{ ctrl_type, name });
-    const exit_code = switch (global.child.kill() catch |err| {
-        log.err("failed to kill process, error={s}", .{@errorName(err)});
-        std.process.exit(0xff);
-    }) {
-        .Exited => |e| e,
-        .Signal => 0xff,
-        .Stopped => 0xff,
-        .Unknown => 0xff,
-    };
-    std.process.exit(exit_code);
-    unreachable;
+    if (global.child) |*child| {
+        child.kill(global.io);
+    }
+    std.process.exit(0xff);
 }
-
 const win32 = struct {
     pub const BOOL = i32;
     pub const CTRL_C_EVENT = @as(u32, 0);
@@ -93,17 +118,12 @@ const win32 = struct {
     pub const CTRL_CLOSE_EVENT = @as(u32, 2);
     pub const CTRL_LOGOFF_EVENT = @as(u32, 5);
     pub const CTRL_SHUTDOWN_EVENT = @as(u32, 6);
-    pub const GetLastError = std.os.windows.kernel32.GetLastError;
-    pub const PHANDLER_ROUTINE = switch (builtin.zig_backend) {
-        .stage1 => fn (
-            CtrlType: u32,
-        ) callconv(@import("std").os.windows.WINAPI) BOOL,
-        else => *const fn (
-            CtrlType: u32,
-        ) callconv(@import("std").os.windows.WINAPI) BOOL,
-    };
+    pub const GetLastError = std.os.windows.GetLastError;
+    pub const PHANDLER_ROUTINE = *const fn (
+        CtrlType: u32,
+    ) callconv(.c) BOOL;
     pub extern "kernel32" fn SetConsoleCtrlHandler(
         HandlerRoutine: ?PHANDLER_ROUTINE,
         Add: BOOL,
-    ) callconv(@import("std").os.windows.WINAPI) BOOL;
+    ) callconv(.c) BOOL;
 };

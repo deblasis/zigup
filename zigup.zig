@@ -601,13 +601,13 @@ fn wsaStartupIfWindows() void {
             wHighVersion: u16,
             iMaxSockets: u16,
             iMaxUdpDg: u16,
-            lpVendorInfo: ?*u8 = null,
-            szDescription: [257]u8 = undefined,
-            szSystemStatus: [129]u8 = undefined,
+            lpVendorInfo: ?*u8,
+            szDescription: [257]u8,
+            szSystemStatus: [129]u8,
         };
         pub extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) callconv(.c) i32;
     };
-    var data: ws2_32.WSADATA = .{};
+    var data: ws2_32.WSADATA = std.mem.zeroes(ws2_32.WSADATA);
     _ = ws2_32.WSAStartup(0x0202, &data);
 }
 
@@ -1119,7 +1119,7 @@ const FileId = struct {
             if (0 == win32.GetFileInformationByHandle(dir.handle, &info)) {
                 std.log.err(
                     "GetFileInformationByHandle on '{s}' failed, error={}",
-                    .{ name_for_error, @intFromEnum(std.os.windows.kernel32.GetLastError()) },
+                    .{ name_for_error, @intFromEnum(std.os.windows.GetLastError()) },
                 );
                 return error.AlreadyReported;
             }

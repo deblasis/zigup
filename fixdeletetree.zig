@@ -22,7 +22,7 @@ pub fn deleteTree(dir: Io.Dir, io: Io, sub_path: []const u8) !void {
             switch (err) {
                 error.FileBusy => {
                     std.log.warn("path '{s}' is busy (attempt {d}), will retry", .{ sub_path, attempt });
-                    Io.sleep(io, Io.Duration.fromMilliseconds(100), .monotonic) catch {};
+                    Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
                 },
                 else => |e| return e,
             }
