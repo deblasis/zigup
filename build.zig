@@ -768,6 +768,6 @@ const CleanDir = struct {
         _ = opts;
         const b = step.owner;
         const clean_dir: *CleanDir = @fieldParentPtr("step", step);
-        try b.build_root.handle.deleteTree(clean_dir.dir_path.getPath(b));
+        try b.build_root.handle.deleteTree(b.graph.io, clean_dir.dir_path.getPath(b));
     }
 };

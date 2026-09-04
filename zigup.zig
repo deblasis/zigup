@@ -1,11 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mem = std.mem;
+const Io = std.Io;
+const process = std.process;
 
 const ArrayList = std.ArrayList;
 const Allocator = mem.Allocator;
 
 const fixdeletetree = @import("fixdeletetree.zig");
+const lanes = @import("lanes.zig");
 
 const arch = switch (builtin.cpu.arch) {
     .aarch64 => "aarch64",
@@ -29,6 +32,13 @@ const os = switch (builtin.os.tag) {
 const os_arch = os ++ "-" ++ arch;
 const arch_os = arch ++ "-" ++ os;
 const archive_ext = if (builtin.os.tag == .windows) "zip" else "tar.xz";
+
+// Stashed by main() — single-threaded CLI; 0.16-final std threads an `Io`
+// handle (and the environ map) through every operation instead.
+var g_io: Io = undefined;
+var g_gpa: Allocator = undefined;
+var g_env: *const process.Environ.Map = undefined;
+var g_lane_ctx: lanes.Ctx = undefined;
 
 var global_override_appdata: ?[]const u8 = null; // only used for testing
 var global_optional_install_dir: ?[]const u8 = null;
@@ -55,8 +65,8 @@ const DownloadResult = union(enum) {
         }
     }
 };
-fn download(allocator: Allocator, url: []const u8, writer: *std.Io.Writer) DownloadResult {
-    var client = std.http.Client{ .allocator = allocator };
+fn download(allocator: Allocator, url: []const u8, writer: *Io.Writer) DownloadResult {
+    var client = std.http.Client{ .allocator = allocator, .io = g_io };
     defer client.deinit();
 
     var fetch_result = client.fetch(.{
@@ -82,7 +92,7 @@ const DownloadStringResult = union(enum) {
     err: []u8,
 };
 fn downloadToString(allocator: Allocator, url: []const u8) DownloadStringResult {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
+    var aw: Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     switch (download(allocator, url, &aw.writer)) {
         .ok => return .{ .ok = aw.toOwnedSlice() catch |e| oom(e) },
@@ -90,15 +100,11 @@ fn downloadToString(allocator: Allocator, url: []const u8) DownloadStringResult 
     }
 }
 
-fn ignoreHttpCallback(request: []const u8) void {
-    _ = request;
-}
-
 fn allocInstallDirStringXdg(allocator: Allocator) error{AlreadyReported}![]const u8 {
     // see https://specifications.freedesktop.org/basedir-spec/latest/#variables
     // try $XDG_DATA_HOME/zigup first
     xdg_var: {
-        const xdg_data_home = std.posix.getenv("XDG_DATA_HOME") orelse break :xdg_var;
+        const xdg_data_home = g_env.get("XDG_DATA_HOME") orelse break :xdg_var;
         if (xdg_data_home.len == 0) break :xdg_var;
         if (!std.fs.path.isAbsolute(xdg_data_home)) {
             std.log.err("$XDG_DATA_HOME environment variable '{s}' is not an absolute path", .{xdg_data_home});
@@ -107,7 +113,7 @@ fn allocInstallDirStringXdg(allocator: Allocator) error{AlreadyReported}![]const
         return std.fs.path.join(allocator, &[_][]const u8{ xdg_data_home, "zigup" }) catch |e| oom(e);
     }
     // .. then fallback to $HOME/.local/share/zigup
-    const home = std.posix.getenv("HOME") orelse {
+    const home = g_env.get("HOME") orelse {
         std.log.err("cannot find install directory, neither $HOME nor $XDG_DATA_HOME environment variables are set", .{});
         return error.AlreadyReported;
     };
@@ -118,47 +124,66 @@ fn allocInstallDirStringXdg(allocator: Allocator) error{AlreadyReported}![]const
     return std.fs.path.join(allocator, &[_][]const u8{ home, ".local", "share", "zigup" }) catch |e| oom(e);
 }
 
+/// The settings dir is shared with the lane machinery (one file layout):
+/// `--appdata` (tests) > $ZIGUP_SETTINGS|$ZLANE_SETTINGS > platform
+/// (%LOCALAPPDATA%\zigup on Windows, ~/Library/Application Support/zigup on
+/// macOS, $XDG_CONFIG_HOME|~/.config/zigup elsewhere).
 fn getSettingsDir(allocator: Allocator) ?[]const u8 {
-    const appdata: ?[]const u8 = std.fs.getAppDataDir(allocator, "zigup") catch |err| switch (err) {
-        error.OutOfMemory => |e| oom(e),
-        error.AppDataDirUnavailable => null,
+    _ = allocator;
+    if (global_override_appdata) |appdata_override| return appdata_override;
+    return lanes.settingsDir(g_lane_ctx) catch null;
+}
+
+/// Absolute directory of this executable, derived from argv[0] — anchored
+/// on the cwd because fs.path.resolve can return a RELATIVE path when fed
+/// relative inputs (0.16-final std has no selfExe API).
+fn selfExeDir() ?[]const u8 {
+    const argv0 = g_lane_ctx.argv0;
+    const cwd = process.currentPathAlloc(g_io, g_gpa) catch return null;
+    const abs = if (std.fs.path.isAbsolute(argv0))
+        argv0
+    else
+        std.fs.path.resolve(g_gpa, &.{ cwd, argv0 }) catch return null;
+    const d = std.fs.path.dirname(abs) orelse return null;
+    if (d.len == 0) return null;
+    var dir = d;
+    while (dir.len > 1 and (dir[dir.len - 1] == '/' or dir[dir.len - 1] == '\\')) dir = dir[0 .. dir.len - 1];
+    return dir;
+}
+
+fn readFileSetting(allocator: Allocator, path: []const u8, max: usize, what: []const u8) !?[]const u8 {
+    const content = blk: {
+        var file = Io.Dir.cwd().openFile(g_io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => |e| {
+                std.log.err("open '{s}' failed with {s}", .{ path, @errorName(e) });
+                return error.AlreadyReported;
+            },
+        };
+        defer file.close(g_io);
+        var buf: [1]u8 = undefined;
+        var fr = file.reader(g_io, &buf);
+        break :blk fr.interface.allocRemaining(allocator, .limited(max)) catch |err| {
+            std.log.err("read {s} from '{s}' failed with {s}", .{ what, path, @errorName(err) });
+            return error.AlreadyReported;
+        };
     };
-    // just used for testing, but note we still test getting the builtin appdata dir either way
-    if (global_override_appdata) |appdata_override| {
-        if (appdata) |a| allocator.free(a);
-        return allocator.dupe(u8, appdata_override) catch |e| oom(e);
-    }
-    return appdata;
+    return content;
 }
 
 fn readInstallDir(allocator: Allocator) !?[]const u8 {
     const settings_dir_path = getSettingsDir(allocator) orelse return null;
-    defer allocator.free(settings_dir_path);
     const setting_path = std.fs.path.join(allocator, &.{ settings_dir_path, "install-dir" }) catch |e| oom(e);
-    defer allocator.free(setting_path);
-    const content = blk: {
-        var file = std.fs.cwd().openFile(setting_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            else => |e| {
-                std.log.err("open '{s}' failed with {s}", .{ setting_path, @errorName(e) });
-                return error.AlreadyReported;
-            },
-        };
-        defer file.close();
-        break :blk file.readToEndAlloc(allocator, 9999) catch |err| {
-            std.log.err("read install dir from '{s}' failed with {s}", .{ setting_path, @errorName(err) });
-            return error.AlreadyReported;
-        };
-    };
-    errdefer allocator.free(content);
-    const stripped = std.mem.trimRight(u8, content, " \r\n");
+    const content = (try readFileSetting(allocator, setting_path, 9999, "install dir")) orelse return null;
+
+    const stripped = std.mem.trimEnd(u8, content, " \r\n");
 
     if (!std.fs.path.isAbsolute(stripped)) {
         std.log.err("install directory '{s}' is not an absolute path, fix this by running `zigup set-install-dir`", .{stripped});
         return error.BadInstallDirSetting;
     }
 
-    return allocator.realloc(content, stripped.len) catch |e| oom(e);
+    return stripped;
 }
 
 fn saveInstallDir(allocator: Allocator, maybe_dir: ?[]const u8) !void {
@@ -166,16 +191,14 @@ fn saveInstallDir(allocator: Allocator, maybe_dir: ?[]const u8) !void {
         std.log.err("cannot save install dir, unable to find a suitable settings directory", .{});
         return error.AlreadyReported;
     };
-    defer allocator.free(settings_dir_path);
     const setting_path = std.fs.path.join(allocator, &.{ settings_dir_path, "install-dir" }) catch |e| oom(e);
-    defer allocator.free(setting_path);
     if (maybe_dir) |d| {
-        if (std.fs.path.dirname(setting_path)) |dir| try std.fs.cwd().makePath(dir);
+        try Io.Dir.cwd().createDirPath(g_io, settings_dir_path);
 
         {
-            var file = try std.fs.cwd().createFile(setting_path, .{});
-            defer file.close();
-            var fw = file.writer(&.{});
+            var file = try Io.Dir.cwd().createFile(g_io, setting_path, .{ .truncate = true });
+            defer file.close(g_io);
+            var fw = file.writerStreaming(g_io, &.{});
             try fw.interface.writeAll(d);
             try fw.interface.flush();
         }
@@ -185,13 +208,12 @@ fn saveInstallDir(allocator: Allocator, maybe_dir: ?[]const u8) !void {
             std.log.err("unable to readback install-dir after saving it", .{});
             return error.AlreadyReported;
         };
-        defer allocator.free(readback);
         if (!std.mem.eql(u8, readback, d)) {
             std.log.err("saved install dir readback mismatch\nwrote: '{s}'\nread : '{s}'\n", .{ d, readback });
             return error.AlreadyReported;
         }
     } else {
-        std.fs.cwd().deleteFile(setting_path) catch |err| switch (err) {
+        Io.Dir.cwd().deleteFile(g_io, setting_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => |e| return e,
         };
@@ -200,11 +222,10 @@ fn saveInstallDir(allocator: Allocator, maybe_dir: ?[]const u8) !void {
 
 fn getBuiltinInstallDir(allocator: Allocator) error{AlreadyReported}![]const u8 {
     if (builtin.os.tag == .windows) {
-        const self_exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch |e| {
-            std.log.err("failed to get exe dir path with {s}", .{@errorName(e)});
+        const self_exe_dir = selfExeDir() orelse {
+            std.log.err("failed to determine this executable's directory from argv[0]", .{});
             return error.AlreadyReported;
         };
-        defer allocator.free(self_exe_dir);
         return std.fs.path.join(allocator, &.{ self_exe_dir, "zig" }) catch |e| oom(e);
     }
     return allocInstallDirStringXdg(allocator);
@@ -243,17 +264,15 @@ fn getInstallDir(allocator: Allocator, options: GetInstallDirOptions) ![]const u
 fn makeZigPathLinkString(allocator: Allocator) ![]const u8 {
     if (global_optional_path_link) |path| return path;
 
-    const zigup_dir = try std.fs.selfExeDirPathAlloc(allocator);
-    defer allocator.free(zigup_dir);
+    const zigup_dir = selfExeDir() orelse return error.SelfExeDirUnavailable;
 
     return try std.fs.path.join(allocator, &[_][]const u8{ zigup_dir, comptime "zig" ++ builtin.target.exeFileExt() });
 }
 
-// TODO: this should be in standard lib
+// TODO: this should be in standard lib somewhere
 fn toAbsolute(allocator: Allocator, path: []const u8) ![]u8 {
     std.debug.assert(!std.fs.path.isAbsolute(path));
-    const cwd = try std.process.getCwdAlloc(allocator);
-    defer allocator.free(cwd);
+    const cwd = try process.currentPathAlloc(g_io, allocator);
     return std.fs.path.join(allocator, &[_][]const u8{ cwd, path });
 }
 
@@ -283,15 +302,24 @@ fn help(allocator: Allocator) !void {
         \\                                that aren't the default, master, or marked to keep.
         \\  zigup keep VERSION            mark a compiler to be kept during clean
         \\  zigup run VERSION ARGS...     run the given VERSION of the compiler with the given ARGS...
+        \\                                (with no installed VERSION, `run` acts as the `zig` shim instead)
         \\
         \\Lanes (multiple named compiler lines on one machine):
         \\
         \\  zigup lane set <name> <dir>   register lane <name> backed by a toolchain dir
-        \\  zigup lane list               list lanes and the default
-        \\  zigup lane default [name]     get or set the default lane
+        \\  zigup lane list               list lanes
         \\  zigup lane remove <name>      remove a lane
-        \\  zigup lane shim <name>...     install lane shims (incl. `zig`) next to zigup
-        \\                                resolution: $ZIGUP_LANE > ./.ziglane > default lane
+        \\  zigup lane shim [name]...     install lane shims (incl. `zig`) next to zigup
+        \\  zigup which | path            what `zig` resolves to, and why
+        \\  zigup doctor                  diagnose the whole zig setup (lanes, PATH, env)
+        \\  zigup run [args...]           act as the `zig` shim (when args[0] is not an
+        \\                                installed compiler version)
+        \\
+        \\                                `zig` resolution: ./.ziglane (cwd and ancestors)
+        \\                                  > $ZIGUP_LANE > zig on PATH (project-first, NO
+        \\                                  machine-wide default; $ZIGUP_LANE=path skips lanes;
+        \\                                  an explicit pin that is broken is an error, never
+        \\                                  a substitution)
         \\
         \\  zigup get-install-dir         prints the install directory to stdout
         \\  zigup set-install-dir [PATH]  set the default install directory, omitting the PATH reverts to the builtin default
@@ -322,7 +350,7 @@ fn help(allocator: Allocator) !void {
     );
 }
 
-fn getCmdOpt(args: [][:0]u8, i: *usize) ![]const u8 {
+fn getCmdOpt(args: [][]const u8, i: *usize) ![]const u8 {
     i.* += 1;
     if (i.* == args.len) {
         std.log.err("option '{s}' requires an argument", .{args[i.* - 1]});
@@ -331,28 +359,52 @@ fn getCmdOpt(args: [][:0]u8, i: *usize) ![]const u8 {
     return args[i.*];
 }
 
-pub fn main() !u8 {
-    return main2() catch |e| switch (e) {
+pub fn main(init: process.Init) !u8 {
+    // Arena over page memory: a short-lived CLI that never frees. (The
+    // process.Init gpa is a DebugAllocator that leak-reports at exit —
+    // noise for a run-and-exit tool.)
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena.allocator();
+    g_gpa = allocator;
+    g_io = init.io;
+    g_env = init.environ_map;
+
+    var it = try process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    const argv0 = it.next() orelse {
+        std.debug.print("zigup: no argv[0]\n", .{});
+        return 0xff;
+    };
+    var args_array: ArrayList([]const u8) = .empty;
+    try args_array.append(allocator, argv0);
+    while (it.next()) |a| try args_array.append(allocator, a);
+
+    var prog = std.fs.path.basename(argv0);
+    if (std.mem.endsWith(u8, prog, ".exe")) prog = prog[0 .. prog.len - 4];
+    g_lane_ctx = .{
+        .io = init.io,
+        .gpa = allocator,
+        .env = init.environ_map,
+        .argv0 = argv0,
+        .prog = prog,
+        .appdata_override = null,
+    };
+
+    return main2(allocator, args_array.items) catch |e| switch (e) {
         error.AlreadyReported => return 1,
         else => return e,
     };
 }
-pub fn main2() !u8 {
-    if (builtin.os.tag == .windows) {
-        _ = try std.os.windows.WSAStartup(2, 2);
-    }
-
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const allocator = arena.allocator();
+pub fn main2(allocator: Allocator, args_array: []const []const u8) !u8 {
+    wsaStartupIfWindows();
 
     // lane shims (zig, zig_ccached, vigz, ...) dispatch before CLI parsing
-    if (try @import("lanes.zig").shimDispatch(allocator)) |code| return code;
+    // so that compiler args pass through untouched
+    const args_with_argv0: [][]const u8 = @constCast(args_array);
+    if (args_with_argv0.len >= 1) {
+        if (try lanes.shimDispatch(g_lane_ctx, args_with_argv0[1..])) |code| return code;
+    }
 
-    const args_array = try std.process.argsAlloc(allocator);
-    // no need to free, os will do it
-    //defer std.process.argsFree(allocator, argsArray);
-
-    var args = if (args_array.len == 0) args_array else args_array[1..];
+    var args = if (args_array.len == 0) args_with_argv0 else args_with_argv0[1..];
     // parse common options
 
     var index_url: []const u8 = default_index_url;
@@ -380,9 +432,10 @@ pub fn main2() !u8 {
             } else if (std.mem.eql(u8, "--appdata", arg)) {
                 // NOTE: this is a private option just used for testing
                 global_override_appdata = try getCmdOpt(args, &i);
+                g_lane_ctx.appdata_override = global_override_appdata;
             } else {
                 if (newlen == 0 and std.mem.eql(u8, "run", arg)) {
-                    return try runCompiler(allocator, args[i + 1 ..]);
+                    return try runSubcommand(allocator, args[i + 1 ..]);
                 }
                 args[newlen] = args[i];
                 newlen += 1;
@@ -394,26 +447,14 @@ pub fn main2() !u8 {
         try help(allocator);
         return 1;
     }
-    // lane management subcommands
-    const lanes_mod = @import("lanes.zig");
-    if (std.mem.eql(u8, "lane", args[0])) {
-        if (args.len >= 3 and std.mem.eql(u8, args[1], "set")) {
-            return try lanes_mod.laneSet(allocator, args[2], args[3]);
-        }
-        if (args.len == 3 and std.mem.eql(u8, args[1], "remove")) {
-            return try lanes_mod.laneRemove(allocator, args[2]);
-        }
-        if (args.len >= 2 and std.mem.eql(u8, args[1], "list")) {
-            return try lanes_mod.laneList(allocator);
-        }
-        if (args.len >= 2 and std.mem.eql(u8, args[1], "default")) {
-            return try lanes_mod.laneDefault(allocator, if (args.len >= 3) args[2] else null);
-        }
-        if (args.len >= 3 and std.mem.eql(u8, args[1], "shim")) {
-            return try lanes_mod.shimInstall(allocator, args[2..]);
-        }
-        std.log.err("usage: zigup lane set <name> <dir> | lane remove <name> | lane list | lane default [name] | lane shim <name>...", .{});
-        return 1;
+    // lane management / diagnostics subcommands
+    if (std.mem.eql(u8, "lane", args[0]) or std.mem.eql(u8, "lanes", args[0])) {
+        return try lanes.cli(g_lane_ctx, args[1..]);
+    }
+    if (std.mem.eql(u8, "doctor", args[0]) or std.mem.eql(u8, "which", args[0]) or
+        std.mem.eql(u8, "path", args[0]))
+    {
+        return try lanes.cli(g_lane_ctx, args);
     }
     if (std.mem.eql(u8, "get-install-dir", args[0])) {
         if (args.len != 1) {
@@ -424,10 +465,8 @@ pub fn main2() !u8 {
             error.AlreadyReported => return 1,
             else => |e| return e,
         };
-        var out_w = std.fs.File.stdout().writer(&.{});
-        try out_w.interface.writeAll(install_dir);
-        try out_w.interface.writeAll("\n");
-        try out_w.interface.flush();
+        try Io.File.stdout().writeStreamingAll(g_io, install_dir);
+        try Io.File.stdout().writeStreamingAll(g_io, "\n");
         return 0;
     }
     if (std.mem.eql(u8, "set-install-dir", args[0])) {
@@ -456,7 +495,7 @@ pub fn main2() !u8 {
         }
         var download_index = try fetchDownloadIndex(allocator, index_url);
         defer download_index.deinit(allocator);
-        try std.fs.File.stdout().writeAll(download_index.text);
+        try Io.File.stdout().writeStreamingAll(g_io, download_index.text);
         return 0;
     }
     if (std.mem.eql(u8, "fetch", args[0])) {
@@ -508,11 +547,11 @@ pub fn main2() !u8 {
                     break :init_resolved version_string;
 
                 const optional_master_dir: ?[]const u8 = blk: {
-                    var install_dir = std.fs.openDirAbsolute(install_dir_string, .{ .iterate = true }) catch |e| switch (e) {
+                    var install_dir = Io.Dir.openDirAbsolute(g_io, install_dir_string, .{ .iterate = true }) catch |e| switch (e) {
                         error.FileNotFound => break :blk null,
                         else => return e,
                     };
-                    defer install_dir.close();
+                    defer install_dir.close(g_io);
                     break :blk try getMasterDir(allocator, &install_dir);
                 };
                 // no need to free master_dir, this is a short lived program
@@ -534,11 +573,42 @@ pub fn main2() !u8 {
         return 0;
     }
     const command = args[0];
-    args = args[1..];
     std.log.err("command not impl '{s}'", .{command});
     return 1;
+}
 
-    //const optionalInstallPath = try find_zigs(allocator);
+/// `zigup run ...` — stock behavior (run an installed VERSION from the
+/// zigup pool) when the first word names an installed compiler; otherwise
+/// exactly what the `zig` shim would do (lane resolution).
+fn runSubcommand(allocator: Allocator, rest: []const []const u8) !u8 {
+    if (rest.len >= 1) {
+        if (getInstallDir(allocator, .{ .create = false, .log = false })) |install_dir_string| {
+            const compiler_dir = try std.fs.path.join(allocator, &[_][]const u8{ install_dir_string, rest[0] });
+            if (existsAbsolute(compiler_dir) catch false) return try runCompiler(allocator, rest);
+        } else |_| {}
+    }
+    return try lanes.runAsZig(g_lane_ctx, rest);
+}
+
+/// 0.16-final removed std.os.windows.WSAStartup; the new Io uses NTDLL
+/// sockets directly, but initializing winsock anyway is harmless insurance
+/// for any libc/winsock path still taken (e.g. TLS).
+fn wsaStartupIfWindows() void {
+    if (builtin.os.tag != .windows) return;
+    const ws2_32 = struct {
+        const WSADATA = extern struct {
+            wVersion: u16,
+            wHighVersion: u16,
+            iMaxSockets: u16,
+            iMaxUdpDg: u16,
+            lpVendorInfo: ?*u8 = null,
+            szDescription: [257]u8 = undefined,
+            szSystemStatus: [129]u8 = undefined,
+        };
+        pub extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) callconv(.c) i32;
+    };
+    var data: ws2_32.WSADATA = .{};
+    _ = ws2_32.WSAStartup(0x0202, &data);
 }
 
 pub fn runCompiler(allocator: Allocator, args: []const []const u8) !u8 {
@@ -559,17 +629,25 @@ pub fn runCompiler(allocator: Allocator, args: []const []const u8) !u8 {
         return 1;
     }
 
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(allocator, try std.fs.path.join(allocator, &.{ compiler_dir, "files", comptime "zig" ++ builtin.target.exeFileExt() }));
+    var argv: ArrayList([]const u8) = .empty;
+    try argv.append(allocator, try std.fs.path.join(allocator, &[_][]const u8{ compiler_dir, "files", comptime "zig" ++ builtin.target.exeFileExt() }));
     try argv.appendSlice(allocator, args[1..]);
 
-    // TODO: use "execve" if on linux
-    var proc = std.process.Child.init(argv.items, allocator);
-    const ret_val = try proc.spawnAndWait();
+    var child = process.spawn(g_io, .{
+        .argv = argv.items,
+        .environ_map = null,
+    }) catch |err| {
+        std.log.err("failed to spawn compiler: {s}", .{@errorName(err)});
+        return 0xff;
+    };
+    const ret_val = child.wait(g_io) catch |err| {
+        std.log.err("failed waiting on compiler: {s}", .{@errorName(err)});
+        return 0xff;
+    };
     switch (ret_val) {
-        .Exited => |code| return code,
+        .exited => |code| return code,
         else => |result| {
-            std.log.err("compiler exited with {}", .{result});
+            std.log.err("compiler exited with {t}", .{result});
             return 0xff;
         },
     }
@@ -615,9 +693,11 @@ fn fetchCompiler(
         const master_symlink = try std.fs.path.join(allocator, &[_][]const u8{ install_dir, "master" });
         defer allocator.free(master_symlink);
         if (builtin.os.tag == .windows) {
-            var file = try std.fs.createFileAbsolute(master_symlink, .{});
-            defer file.close();
-            try file.writer().writeAll(version_url.version);
+            var file = try Io.Dir.createFileAbsolute(g_io, master_symlink, .{ .truncate = true });
+            defer file.close(g_io);
+            var fw = file.writerStreaming(g_io, &.{});
+            try fw.interface.writeAll(version_url.version);
+            try fw.interface.flush();
         } else {
             _ = try loggyUpdateSymlink(version_url.version, master_symlink, .{ .is_directory = true });
         }
@@ -664,7 +744,7 @@ fn loggyMakePath(dir_absolute: []const u8) !void {
     } else {
         loginfo("mkdir -p '{s}'", .{dir_absolute});
     }
-    try std.fs.cwd().makePath(dir_absolute);
+    try Io.Dir.cwd().createDirPath(g_io, dir_absolute);
 }
 
 fn loggyDeleteTreeAbsolute(dir_absolute: []const u8) !void {
@@ -673,32 +753,32 @@ fn loggyDeleteTreeAbsolute(dir_absolute: []const u8) !void {
     } else {
         loginfo("rm -rf '{s}'", .{dir_absolute});
     }
-    try fixdeletetree.deleteTreeAbsolute(dir_absolute);
+    try fixdeletetree.deleteTreeAbsolute(g_io, dir_absolute);
 }
 
 pub fn loggyRenameAbsolute(old_path: []const u8, new_path: []const u8) !void {
     loginfo("mv '{s}' '{s}'", .{ old_path, new_path });
-    try std.fs.renameAbsolute(old_path, new_path);
+    try Io.Dir.renameAbsolute(old_path, new_path, g_io);
 }
 
-pub fn loggySymlinkAbsolute(target_path: []const u8, sym_link_path: []const u8, flags: std.fs.Dir.SymLinkFlags) !void {
+pub fn loggySymlinkAbsolute(target_path: []const u8, sym_link_path: []const u8, flags: Io.Dir.SymLinkFlags) !void {
     loginfo("ln -s '{s}' '{s}'", .{ target_path, sym_link_path });
-    // NOTE: can't use symLinkAbsolute because it requires target_path to be absolute but we don't want that
-    //       not sure if it is a bug in the standard lib or not
-    //try std.fs.symLinkAbsolute(target_path, sym_link_path, flags);
-    _ = flags;
-    try std.posix.symlink(target_path, sym_link_path);
+    // NOTE: symLinkAbsolute asserts the target is absolute, but the `master`
+    //       link target is deliberately relative; the cwd handle accepts
+    //       absolute link paths.
+    try Io.Dir.cwd().symLink(g_io, target_path, sym_link_path, flags);
 }
 
 /// returns: true if the symlink was updated, false if it was already set to the given `target_path`
-pub fn loggyUpdateSymlink(target_path: []const u8, sym_link_path: []const u8, flags: std.fs.Dir.SymLinkFlags) !bool {
+pub fn loggyUpdateSymlink(target_path: []const u8, sym_link_path: []const u8, flags: Io.Dir.SymLinkFlags) !bool {
     var current_target_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.fs.readLinkAbsolute(sym_link_path, &current_target_path_buffer)) |current_target_path| {
+    if (Io.Dir.readLinkAbsolute(g_io, sym_link_path, &current_target_path_buffer)) |len| {
+        const current_target_path = current_target_path_buffer[0..len];
         if (std.mem.eql(u8, target_path, current_target_path)) {
             loginfo("symlink '{s}' already points to '{s}'", .{ sym_link_path, target_path });
             return false; // already up-to-date
         }
-        try std.posix.unlink(sym_link_path);
+        Io.Dir.cwd().deleteFile(g_io, sym_link_path) catch {};
     } else |e| switch (e) {
         error.FileNotFound => {},
         error.NotLink => {
@@ -716,20 +796,9 @@ pub fn loggyUpdateSymlink(target_path: []const u8, sym_link_path: []const u8, fl
 
 // TODO: this should be in std lib somewhere
 fn existsAbsolute(absolutePath: []const u8) !bool {
-    std.fs.cwd().access(absolutePath, .{}) catch |e| switch (e) {
+    Io.Dir.cwd().access(g_io, absolutePath, .{}) catch |e| switch (e) {
         error.FileNotFound => return false,
-        error.PermissionDenied => return e,
-        error.AccessDenied => return e,
-        error.InputOutput => return e,
-        error.SystemResources => return e,
-        error.SymLinkLoop => return e,
-        error.FileBusy => return e,
-        error.Unexpected => unreachable,
-        error.InvalidUtf8 => return e,
-        error.InvalidWtf8 => return e,
-        error.ReadOnlyFileSystem => unreachable,
-        error.NameTooLong => unreachable,
-        error.BadPathName => unreachable,
+        else => return e,
     };
     return true;
 }
@@ -738,22 +807,26 @@ fn listCompilers(allocator: Allocator) !void {
     const install_dir_string = try getInstallDir(allocator, .{ .create = false });
     defer allocator.free(install_dir_string);
 
-    var install_dir = std.fs.openDirAbsolute(install_dir_string, .{ .iterate = true }) catch |e| switch (e) {
+    var install_dir = Io.Dir.openDirAbsolute(g_io, install_dir_string, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound => return,
         else => return e,
     };
-    defer install_dir.close();
+    defer install_dir.close(g_io);
 
-    var stdout = std.fs.File.stdout().writer(&.{}).interface;
+    var buf: [256]u8 = undefined;
+    var stdout_file = Io.File.stdout();
+    var w = stdout_file.writerStreaming(g_io, &buf);
+    const stdout = &w.interface;
     {
         var it = install_dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(g_io)) |entry| {
             if (entry.kind != .directory)
                 continue;
             if (std.mem.endsWith(u8, entry.name, ".installing"))
                 continue;
             try stdout.print("{s}\n", .{entry.name});
         }
+        try stdout.flush();
     }
 }
 
@@ -761,18 +834,19 @@ fn keepCompiler(allocator: Allocator, compiler_version: []const u8) !void {
     const install_dir_string = try getInstallDir(allocator, .{ .create = true });
     defer allocator.free(install_dir_string);
 
-    var install_dir = try std.fs.openDirAbsolute(install_dir_string, .{ .iterate = true });
-    defer install_dir.close();
+    var install_dir = try Io.Dir.openDirAbsolute(g_io, install_dir_string, .{ .iterate = true });
+    defer install_dir.close(g_io);
 
-    var compiler_dir = install_dir.openDir(compiler_version, .{}) catch |e| switch (e) {
+    var compiler_dir = install_dir.openDir(g_io, compiler_version, .{}) catch |e| switch (e) {
         error.FileNotFound => {
             std.log.err("compiler not found: {s}", .{compiler_version});
             return error.AlreadyReported;
         },
         else => return e,
     };
-    var keep_fd = try compiler_dir.createFile("keep", .{});
-    keep_fd.close();
+    defer compiler_dir.close(g_io);
+    var keep_fd = try compiler_dir.createFile(g_io, "keep", .{});
+    keep_fd.close(g_io);
     loginfo("created '{s}{c}{s}{c}{s}'", .{ install_dir_string, std.fs.path.sep, compiler_version, std.fs.path.sep, "keep" });
 }
 
@@ -783,11 +857,11 @@ fn cleanCompilers(allocator: Allocator, compiler_name_opt: ?[]const u8) !void {
     const default_comp_opt = try getDefaultCompiler(allocator);
     defer if (default_comp_opt) |default_compiler| allocator.free(default_compiler);
 
-    var install_dir = std.fs.openDirAbsolute(install_dir_string, .{ .iterate = true }) catch |e| switch (e) {
+    var install_dir = Io.Dir.openDirAbsolute(g_io, install_dir_string, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound => return,
         else => return e,
     };
-    defer install_dir.close();
+    defer install_dir.close(g_io);
     const master_points_to_opt = try getMasterDir(allocator, &install_dir);
     defer if (master_points_to_opt) |master_points_to| allocator.free(master_points_to);
     if (compiler_name_opt) |compiler_name| {
@@ -796,10 +870,10 @@ fn cleanCompilers(allocator: Allocator, compiler_name_opt: ?[]const u8) !void {
             return error.AlreadyReported;
         }
         loginfo("deleting '{s}{c}{s}'", .{ install_dir_string, std.fs.path.sep, compiler_name });
-        try fixdeletetree.deleteTree(install_dir, compiler_name);
+        try fixdeletetree.deleteTree(install_dir, g_io, compiler_name);
     } else {
         var it = install_dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(g_io)) |entry| {
             if (entry.kind != .directory)
                 continue;
             if (getKeepReason(master_points_to_opt, default_comp_opt, entry.name)) |reason| {
@@ -808,9 +882,9 @@ fn cleanCompilers(allocator: Allocator, compiler_name_opt: ?[]const u8) !void {
             }
 
             {
-                var compiler_dir = try install_dir.openDir(entry.name, .{});
-                defer compiler_dir.close();
-                if (compiler_dir.access("keep", .{})) |_| {
+                var compiler_dir = try install_dir.openDir(g_io, entry.name, .{});
+                defer compiler_dir.close(g_io);
+                if (compiler_dir.access(g_io, "keep", .{})) |_| {
                     loginfo("keeping '{s}' (has keep file)", .{entry.name});
                     continue;
                 } else |e| switch (e) {
@@ -819,7 +893,7 @@ fn cleanCompilers(allocator: Allocator, compiler_name_opt: ?[]const u8) !void {
                 }
             }
             loginfo("deleting '{s}{c}{s}'", .{ install_dir_string, std.fs.path.sep, entry.name });
-            try fixdeletetree.deleteTree(install_dir, entry.name);
+            try fixdeletetree.deleteTree(install_dir, g_io, entry.name);
         }
     }
 }
@@ -828,13 +902,12 @@ fn readDefaultCompiler(allocator: Allocator, buffer: *[std.fs.max_path_bytes + 1
     defer allocator.free(path_link);
 
     if (builtin.os.tag == .windows) {
-        var file = std.fs.openFileAbsolute(path_link, .{}) catch |e| switch (e) {
+        var file = Io.Dir.openFileAbsolute(g_io, path_link, .{}) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
         };
-        defer file.close();
-        try file.seekTo(win32exelink.exe_offset);
-        const len = try file.readAll(buffer);
+        defer file.close(g_io);
+        const len = try file.readPositionalAll(g_io, buffer, win32exelink.exe_offset);
         if (len != buffer.len) {
             std.log.err("path link file '{s}' is too small", .{path_link});
             return error.AlreadyReported;
@@ -843,30 +916,35 @@ fn readDefaultCompiler(allocator: Allocator, buffer: *[std.fs.max_path_bytes + 1
         return try allocator.dupe(u8, targetPathToVersion(target_exe));
     }
 
-    const target_path = std.fs.readLinkAbsolute(path_link, buffer[0..std.fs.max_path_bytes]) catch |e| switch (e) {
+    const target_len = Io.Dir.readLinkAbsolute(g_io, path_link, buffer[0..std.fs.max_path_bytes]) catch |e| switch (e) {
         error.FileNotFound => return null,
         else => return e,
     };
-    defer allocator.free(target_path);
-    return try allocator.dupe(u8, targetPathToVersion(target_path));
+    return try allocator.dupe(u8, targetPathToVersion(buffer[0..target_len]));
 }
 fn targetPathToVersion(target_path: []const u8) []const u8 {
     return std.fs.path.basename(std.fs.path.dirname(std.fs.path.dirname(target_path).?).?);
 }
 
-fn readMasterDir(buffer: *[std.fs.max_path_bytes]u8, install_dir: *std.fs.Dir) !?[]const u8 {
+fn readMasterDir(buffer: *[std.fs.max_path_bytes]u8, install_dir: *Io.Dir) !?[]const u8 {
     if (builtin.os.tag == .windows) {
-        var file = install_dir.openFile("master", .{}) catch |e| switch (e) {
+        var file = install_dir.openFile(g_io, "master", .{}) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
         };
-        defer file.close();
-        return buffer[0..try file.readAll(buffer)];
+        defer file.close(g_io);
+        var buf: [1]u8 = undefined;
+        var fr = file.reader(g_io, &buf);
+        const data = try fr.interface.allocRemaining(g_gpa, .limited(std.fs.max_path_bytes));
+        if (data.len > buffer.len) return error.NameTooLong;
+        @memcpy(buffer[0..data.len], data);
+        return buffer[0..data.len];
     }
-    return install_dir.readLink("master", buffer) catch |e| switch (e) {
+    const len = install_dir.readLink(g_io, "master", buffer) catch |e| switch (e) {
         error.FileNotFound => return null,
         else => return e,
     };
+    return buffer[0..len];
 }
 
 fn getDefaultCompiler(allocator: Allocator) !?[]const u8 {
@@ -877,7 +955,7 @@ fn getDefaultCompiler(allocator: Allocator) !?[]const u8 {
     return path_to_return;
 }
 
-fn getMasterDir(allocator: Allocator, install_dir: *std.fs.Dir) !?[]const u8 {
+fn getMasterDir(allocator: Allocator, install_dir: *Io.Dir) !?[]const u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const slice_path = (try readMasterDir(&buffer, install_dir)) orelse return null;
     const path_to_return = try allocator.alloc(u8, slice_path.len);
@@ -888,12 +966,16 @@ fn getMasterDir(allocator: Allocator, install_dir: *std.fs.Dir) !?[]const u8 {
 fn printDefaultCompiler(allocator: Allocator) !void {
     const default_compiler_opt = try getDefaultCompiler(allocator);
     defer if (default_compiler_opt) |default_compiler| allocator.free(default_compiler);
-    var stdout = std.fs.File.stdout().writer(&.{}).interface;
+    var buf: [256]u8 = undefined;
+    var stdout_file = Io.File.stdout();
+    var w = stdout_file.writerStreaming(g_io, &buf);
+    const stdout = &w.interface;
     if (default_compiler_opt) |default_compiler| {
         try stdout.print("{s}\n", .{default_compiler});
     } else {
         try stdout.writeAll("<no-default>\n");
     }
+    try stdout.flush();
 }
 
 const ExistVerify = enum { existence_verified, verify_existence };
@@ -902,14 +984,14 @@ fn setDefaultCompiler(allocator: Allocator, compiler_dir: []const u8, exist_veri
     switch (exist_verify) {
         .existence_verified => {},
         .verify_existence => {
-            var dir = std.fs.openDirAbsolute(compiler_dir, .{}) catch |err| switch (err) {
+            var dir = Io.Dir.openDirAbsolute(g_io, compiler_dir, .{}) catch |err| switch (err) {
                 error.FileNotFound => {
                     std.log.err("compiler '{s}' is not installed", .{std.fs.path.basename(compiler_dir)});
                     return error.AlreadyReported;
                 },
                 else => |e| return e,
             };
-            dir.close();
+            dir.close(g_io);
         },
     }
 
@@ -939,34 +1021,18 @@ fn verifyPathLink(allocator: Allocator, path_link: []const u8) !void {
     };
 
     const path_link_dir_id = blk: {
-        var dir = std.fs.openDirAbsolute(path_link_dir, .{}) catch |err| {
+        var dir = Io.Dir.openDirAbsolute(g_io, path_link_dir, .{}) catch |err| {
             std.log.err("unable to open the path-link directory '{s}': {s}", .{ path_link_dir, @errorName(err) });
             return error.AlreadyReported;
         };
-        defer dir.close();
-        break :blk try FileId.initFromDir(dir, path_link);
+        defer dir.close(g_io);
+        break :blk try FileId.initFromDir(g_io, dir, path_link);
     };
 
     if (builtin.os.tag == .windows) {
-        const path_env = std.process.getEnvVarOwned(allocator, "PATH") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return,
-            else => |e| return e,
-        };
-        defer allocator.free(path_env);
+        const path_env = g_env.get("PATH") orelse return;
 
-        var free_pathext: ?[]const u8 = null;
-        defer if (free_pathext) |p| allocator.free(p);
-
-        const pathext_env = blk: {
-            if (std.process.getEnvVarOwned(allocator, "PATHEXT")) |env| {
-                free_pathext = env;
-                break :blk env;
-            } else |err| switch (err) {
-                error.EnvironmentVariableNotFound => break :blk "",
-                else => |e| return e,
-            }
-            break :blk "";
-        };
+        const pathext_env = g_env.get("PATHEXT") orelse "";
 
         var path_it = std.mem.tokenizeScalar(u8, path_env, ';');
         while (path_it.next()) |path| {
@@ -997,7 +1063,7 @@ fn verifyPathLink(allocator: Allocator, path_link: []const u8) !void {
             }
         }
     } else {
-        var path_it = std.mem.tokenizeScalar(u8, std.posix.getenv("PATH") orelse "", ':');
+        var path_it = std.mem.tokenizeScalar(u8, g_env.get("PATH") orelse "", ':');
         while (path_it.next()) |path| {
             switch (try compareDir(path_link_dir_id, path)) {
                 .missing => continue,
@@ -1018,44 +1084,42 @@ fn verifyPathLink(allocator: Allocator, path_link: []const u8) !void {
 }
 
 fn compareDir(dir_id: FileId, other_dir: []const u8) !enum { missing, access_denied, match, mismatch } {
-    var dir = std.fs.cwd().openDir(other_dir, .{}) catch |err| switch (err) {
+    var dir = Io.Dir.cwd().openDir(g_io, other_dir, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.BadPathName => return .missing,
         error.AccessDenied => return .access_denied,
         else => |e| return e,
     };
-    defer dir.close();
-    return if (dir_id.eql(try FileId.initFromDir(dir, other_dir))) .match else .mismatch;
+    defer dir.close(g_io);
+    return if (dir_id.eql(try FileId.initFromDir(g_io, dir, other_dir))) .match else .mismatch;
 }
 
 fn enforceNoZig(path_link: []const u8, exe: []const u8) !void {
-    var file = std.fs.cwd().openFile(exe, .{}) catch |err| switch (err) {
+    var file = Io.Dir.cwd().openFile(g_io, exe, .{}) catch |err| switch (err) {
         error.FileNotFound, error.IsDir => return,
         error.AccessDenied => return, // if there is a Zig it must not be accessible
         else => |e| return e,
     };
-    defer file.close();
+    defer file.close(g_io);
 
     // todo: on posix systems ignore the file if it is not executable
     std.log.err("zig compiler '{s}' is higher priority in PATH than the path-link '{s}'", .{ exe, path_link });
 }
 
+/// Identity of a directory for PATH comparison. On Windows this is the
+/// volume serial + file index (GetFileInformationByHandle); on POSIX the
+/// new std exposes the inode only (no device id) — same-filesystem
+/// assumption, which holds for the PATH dirs that matter here.
 const FileId = struct {
-    dev: if (builtin.os.tag == .windows) u32 else blk: {
-        const st: std.posix.Stat = undefined;
-        break :blk @TypeOf(st.dev);
-    },
-    ino: if (builtin.os.tag == .windows) u64 else blk: {
-        const st: std.posix.Stat = undefined;
-        break :blk @TypeOf(st.ino);
-    },
+    dev: if (builtin.os.tag == .windows) u32 else u64,
+    ino: u64,
 
-    pub fn initFromFile(file: std.fs.File, filename_for_error: []const u8) !FileId {
+    pub fn initFromDir(io: Io, dir: Io.Dir, name_for_error: []const u8) !FileId {
         if (builtin.os.tag == .windows) {
             var info: win32.BY_HANDLE_FILE_INFORMATION = undefined;
-            if (0 == win32.GetFileInformationByHandle(file.handle, &info)) {
+            if (0 == win32.GetFileInformationByHandle(dir.handle, &info)) {
                 std.log.err(
                     "GetFileInformationByHandle on '{s}' failed, error={}",
-                    .{ filename_for_error, @intFromEnum(std.os.windows.kernel32.GetLastError()) },
+                    .{ name_for_error, @intFromEnum(std.os.windows.kernel32.GetLastError()) },
                 );
                 return error.AlreadyReported;
             }
@@ -1064,18 +1128,11 @@ const FileId = struct {
                 .ino = (@as(u64, @intCast(info.nFileIndexHigh)) << 32) | @as(u64, @intCast(info.nFileIndexLow)),
             };
         }
-        const st = try std.posix.fstat(file.handle);
+        const st = try dir.stat(io);
         return FileId{
-            .dev = st.dev,
-            .ino = st.ino,
+            .dev = 0,
+            .ino = @intCast(st.inode),
         };
-    }
-
-    pub fn initFromDir(dir: std.fs.Dir, name_for_error: []const u8) !FileId {
-        if (builtin.os.tag == .windows) {
-            return initFromFile(std.fs.File{ .handle = dir.fd }, name_for_error);
-        }
-        return initFromFile(std.fs.File{ .handle = dir.fd }, name_for_error);
     }
 
     pub fn eql(self: FileId, other: FileId) bool {
@@ -1104,7 +1161,7 @@ const win32 = struct {
     pub extern "kernel32" fn GetFileInformationByHandle(
         hFile: ?@import("std").os.windows.HANDLE,
         lpFileInformation: ?*BY_HANDLE_FILE_INFORMATION,
-    ) callconv(@import("std").os.windows.WINAPI) BOOL;
+    ) callconv(.c) BOOL;
 };
 
 const win32exelink = struct {
@@ -1126,7 +1183,7 @@ fn createExeLink(link_target: []const u8, path_link: []const u8) !void {
         std.debug.print("Error: path_link (size {}) is too large (max {})\n", .{ path_link.len, std.fs.max_path_bytes });
         return error.AlreadyReported;
     }
-    const file = std.fs.cwd().createFile(path_link, .{}) catch |err| switch (err) {
+    const file = Io.Dir.cwd().createFile(g_io, path_link, .{}) catch |err| switch (err) {
         error.IsDir => {
             std.debug.print(
                 "unable to create the exe link, the path '{s}' is a directory\n",
@@ -1136,10 +1193,12 @@ fn createExeLink(link_target: []const u8, path_link: []const u8) !void {
         },
         else => |e| return e,
     };
-    defer file.close();
-    try file.writer().writeAll(win32exelink.content[0..win32exelink.exe_offset]);
-    try file.writer().writeAll(link_target);
-    try file.writer().writeAll(win32exelink.content[win32exelink.exe_offset + link_target.len ..]);
+    defer file.close(g_io);
+    var fw = file.writerStreaming(g_io, &.{});
+    try fw.interface.writeAll(win32exelink.content[0..win32exelink.exe_offset]);
+    try fw.interface.writeAll(link_target);
+    try fw.interface.writeAll(win32exelink.content[win32exelink.exe_offset + link_target.len ..]);
+    try fw.interface.flush();
 }
 
 const Release = struct {
@@ -1236,7 +1295,7 @@ const SemanticVersion = struct {
     }
     pub fn format(
         self: SemanticVersion,
-        writer: *std.Io.Writer,
+        writer: *Io.Writer,
     ) !void {
         try self.ref().format(writer);
     }
@@ -1287,11 +1346,11 @@ fn installCompiler(allocator: Allocator, compiler_dir: []const u8, url: []const 
         loginfo("downloading '{s}' to '{s}'", .{ url, archive_absolute });
 
         switch (blk: {
-            const file = try std.fs.createFileAbsolute(archive_absolute, .{});
+            const file = try Io.Dir.createFileAbsolute(g_io, archive_absolute, .{});
             // note: important to close the file before we handle errors below
             //       since it will delete the parent directory of this file
-            defer file.close();
-            var fw = file.writer(&.{});
+            defer file.close(g_io);
+            var fw = file.writer(g_io, &.{});
             break :blk download(allocator, url, &fw.interface);
         }) {
             .ok => {},
@@ -1313,15 +1372,17 @@ fn installCompiler(allocator: Allocator, compiler_dir: []const u8, url: []const 
                     recognized = true;
                     archive_root_dir = archive_basename[0 .. archive_basename.len - ".zip".len];
 
-                    var installing_dir_opened = try std.fs.openDirAbsolute(installing_dir, .{});
-                    defer installing_dir_opened.close();
+                    var installing_dir_opened = try Io.Dir.openDirAbsolute(g_io, installing_dir, .{});
+                    defer installing_dir_opened.close(g_io);
                     loginfo("extracting archive to \"{s}\"", .{installing_dir});
-                    var timer = try std.time.Timer.start();
-                    var archive_file = try std.fs.openFileAbsolute(archive_absolute, .{});
-                    defer archive_file.close();
-                    try std.zip.extract(installing_dir_opened, archive_file.seekableStream(), .{});
-                    const time = timer.read();
-                    loginfo("extracted archive in {d:.2} s", .{@as(f32, @floatFromInt(time)) / @as(f32, @floatFromInt(std.time.ns_per_s))});
+                    const start = Io.Timestamp.now(g_io, .awake);
+                    var archive_file = try Io.Dir.openFileAbsolute(g_io, archive_absolute, .{});
+                    defer archive_file.close(g_io);
+                    var archive_buf: [64 * 1024]u8 = undefined;
+                    var archive_reader = archive_file.readerStreaming(g_io, &archive_buf);
+                    try std.zip.extract(installing_dir_opened, &archive_reader, .{});
+                    const dur = Io.Timestamp.durationTo(start, Io.Timestamp.now(g_io, .awake));
+                    loginfo("extracted archive in {d:.2} s", .{@as(f32, @floatFromInt(dur.nanoseconds)) / @as(f32, @floatFromInt(std.time.ns_per_s))});
                 }
             }
 
@@ -1347,10 +1408,13 @@ fn installCompiler(allocator: Allocator, compiler_dir: []const u8, url: []const 
     try loggyRenameAbsolute(installing_dir, compiler_dir);
 }
 
-pub fn run(allocator: Allocator, argv: []const []const u8) !std.process.Child.Term {
+pub fn run(allocator: Allocator, argv: []const []const u8) !process.Child.Term {
     try logRun(allocator, argv);
-    var proc = std.process.Child.init(argv, allocator);
-    return proc.spawnAndWait();
+    var child = try process.spawn(g_io, .{
+        .argv = argv,
+        .environ_map = null,
+    });
+    return child.wait(g_io);
 }
 
 fn logRun(allocator: Allocator, argv: []const []const u8) !void {
