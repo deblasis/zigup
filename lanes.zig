@@ -406,6 +406,9 @@ fn selfDirFrom(ctx: Ctx, argv0: []const u8) ?[]const u8 {
 pub const guard_env = "ZLANE_FALLBACK_ACTIVE";
 
 fn execPathFallback(ctx: Ctx, passthrough: []const []const u8) !u8 {
+    if (ctx.env.get("ZIGUP_DEBUG_ARGV0") != null) {
+        std.debug.print("DBG argv0='{s}' prog='{s}'\n", .{ ctx.argv0, ctx.prog });
+    }
     if (ctx.env.get(guard_env) != null)
         return fatal(ctx, "PATH fallback loop detected (this shim IS the zig on PATH)", .{});
     const zig_path = (try findZigOnPath(ctx, ctx.argv0)) orelse
