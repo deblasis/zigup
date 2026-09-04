@@ -134,7 +134,7 @@ fn selfDir(ctx: Ctx) ?[]const u8 {
     // would anchor on the cwd and make PATH self-exclusion miss the shim's
     // real directory — the fallback would find itself. Resolve a basename-
     // only argv0 against PATH first, exactly as the invoking shell did.
-    if (std.fs.path.dirname(ctx.argv0) == null) {
+    if (isBareName(ctx.argv0)) {
         if (findOnPath(ctx, ctx.argv0)) |hit| {
             return trimTrailingSep(dirnameOf(hit) orelse return null);
         }
@@ -148,6 +148,13 @@ fn selfDir(ctx: Ctx) ?[]const u8 {
     else
         std.fs.path.resolve(ctx.gpa, &.{ cwd, ctx.argv0 }) catch return null;
     return trimTrailingSep(dirnameOf(abs) orelse return null);
+}
+
+/// A basename-only name (no directory component). NOTE: fs.path.dirname
+/// returns "." — not null — for a bare name on some hosts.
+fn isBareName(name: []const u8) bool {
+    const d = std.fs.path.dirname(name) orelse return true;
+    return d.len == 0 or std.mem.eql(u8, d, ".");
 }
 
 /// First hit for `name` (with the platform exe extension) on PATH.
@@ -380,6 +387,11 @@ pub fn findZigOnPath(ctx: Ctx, argv0: []const u8) !?[]const u8 {
 /// from the `zigup` process itself).
 fn selfDirFrom(ctx: Ctx, argv0: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, argv0, ctx.argv0)) return selfDir(ctx);
+    if (isBareName(argv0)) {
+        if (findOnPath(ctx, argv0)) |hit| {
+            return trimTrailingSep(dirnameOf(hit) orelse return null);
+        }
+    }
     const cwd = process.currentPathAlloc(ctx.io, ctx.gpa) catch return null;
     const abs = if (std.fs.path.isAbsolute(argv0))
         argv0
