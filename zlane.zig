@@ -4,19 +4,22 @@
 //! One machine, several compiler lines (stable / ccached / vigz / ...), one
 //! `zig` command that always means the right one:
 //!
-//!   `zig` resolution order:
-//!     1. $ZIGUP_LANE (session pin; the value `path` skips lanes entirely)
-//!     2. .ziglane file in the cwd or an ancestor (project pin — also the
+//!   `zig` resolution order (PROJECT-FIRST — multiple installs/requirements
+//!   are per-project, so the committed pin is the contract):
+//!     1. .ziglane file in the cwd or an ancestor (project pin — also the
 //!        public "safe to use the fork here" marker)
-//!     3. the default lane (`zlane default <name>`)
-//!     4. `zig` found on PATH (excluding this shim's own directory)
+//!     2. $ZIGUP_LANE (session pin; the value `path` skips lanes entirely)
+//!     3. `zig` found on PATH (excluding this shim's own directory)
+//!
+//!   There is NO machine-wide default in the chain: an unpinned folder
+//!   deliberately does NOT guess a lane. A stale exported env var cannot
+//!   hijack a pinned project (the file wins).
 //!
 //!   Fallback discipline: only a source expressing NO intent falls back to
-//!   PATH (nothing configured, or a broken default lane — a machine
-//!   preference must not brick `zig`). An EXPLICIT pin ($ZIGUP_LANE or a
-//!   .ziglane naming a missing/broken lane) is a HARD ERROR: silently
-//!   substituting a different compiler era is exactly the failure class
-//!   lanes exist to prevent.
+//!   PATH (no pin at all). An EXPLICIT pin (.ziglane or $ZIGUP_LANE naming
+//!   a missing/broken lane) is a HARD ERROR: silently substituting a
+//!   different compiler era is exactly the failure class lanes exist to
+//!   prevent.
 //!
 //!   Lane-named shims (`zig_ccached`, `vigz`, ...) always run exactly that
 //!   lane; a broken one is a hard error.
@@ -71,6 +74,23 @@ pub fn main(init: process.Init) !u8 {
 
     const base = basenameNoExe(argv0);
     if (std.mem.eql(u8, base, "zlane")) return try cli(io, gpa, args.items);
+    // Also answer to `zigup` for lane management, so there is ONE command
+    // name across machines: `zigup lane list|set|default|shim`, `zigup
+    // doctor`, `zigup which`. Non-lane zigup subcommands (fetch, etc.) get
+    // a clear pointer instead of a silent divergence.
+    if (std.mem.eql(u8, base, "zigup")) {
+        if (args.items.len == 0) return try cli(io, gpa, &.{});
+        const first = args.items[0];
+        if (std.mem.eql(u8, first, "lane") or std.mem.eql(u8, first, "lanes")) {
+            return try cli(io, gpa, args.items[1..]);
+        }
+        if (std.mem.eql(u8, first, "doctor") or std.mem.eql(u8, first, "which") or
+            std.mem.eql(u8, first, "path") or std.mem.eql(u8, first, "run"))
+        {
+            return try cli(io, gpa, args.items);
+        }
+        return fatal("this zigup is the lane-only shim ('{s}' not supported); the stock zigup fetch machinery is not installed on this machine", .{first});
+    }
     return try shimDispatch(io, gpa, argv0, base, args.items);
 }
 
@@ -132,9 +152,18 @@ fn selfDir(io: Io, gpa: std.mem.Allocator, argv0: []const u8) ?[]const u8 {
 /// argv0 made absolute (readFileSmall via the cwd handle chokes on
 /// relative "./x" forms on some hosts).
 fn selfPathAbs(io: Io, gpa: std.mem.Allocator, argv0: []const u8) []const u8 {
-    if (std.fs.path.isAbsolute(argv0)) return argv0;
-    const cwd = process.currentPathAlloc(io, gpa) catch return argv0;
-    return std.fs.path.resolve(gpa, &.{ cwd, argv0 }) catch argv0;
+    var p: []const u8 = argv0;
+    if (!std.fs.path.isAbsolute(p)) {
+        const cwd = process.currentPathAlloc(io, gpa) catch return argv0;
+        p = std.fs.path.resolve(gpa, &.{ cwd, p }) catch argv0;
+    }
+    // Windows: argv0 may arrive without the .exe extension.
+    if (windows_host and !std.mem.endsWith(u8, p, ".exe")) {
+        Io.Dir.cwd().access(io, p, .{}) catch {
+            return std.fmt.allocPrint(gpa, "{s}.exe", .{p}) catch p;
+        };
+    }
+    return p;
 }
 
 fn readFileSmall(io: Io, gpa: std.mem.Allocator, path: []const u8, max: usize) ?[]u8 {
@@ -253,13 +282,15 @@ fn findDotZiglane(io: Io, gpa: std.mem.Allocator) ?[]const u8 {
 }
 
 fn resolveLane(io: Io, gpa: std.mem.Allocator, env: *const process.Environ.Map) !?Resolved {
+    // PROJECT-FIRST: the committed .ziglane is the contract and beats any
+    // ambient shell state (a stale exported var must not hijack pinned
+    // projects). No machine-wide default participates.
+    if (findDotZiglane(io, gpa)) |from_file| return .{ .name = from_file, .source = .project };
     if (env.get("ZIGUP_LANE")) |v| {
         const trimmed = std.mem.trim(u8, v, " \r\n\t");
         if (trimmed.len > 0) return .{ .name = trimmed, .source = .env };
         return null;
     }
-    if (findDotZiglane(io, gpa)) |from_file| return .{ .name = from_file, .source = .project };
-    if (try getDefaultLane(io, gpa, env)) |d| return .{ .name = d, .source = .default };
     return null;
 }
 
@@ -363,6 +394,7 @@ fn shimDispatch(io: Io, gpa: std.mem.Allocator, argv0: []const u8, base: []const
 
     // The `zig` shim.
     const resolved = (try resolveLane(io, gpa, env)) orelse {
+        // No pin anywhere: PATH, never a machine-wide guess.
         return try execPathFallback(io, gpa, env, argv0, args);
     };
     if (resolved.source == .env and std.mem.eql(u8, resolved.name, "path")) {
@@ -371,10 +403,6 @@ fn shimDispatch(io: Io, gpa: std.mem.Allocator, argv0: []const u8, base: []const
     const lane = findLane(lanes, resolved.name);
     const zig_path = if (lane) |l| try zigExeIn(gpa, io, l.dir) else null;
     if (zig_path == null) {
-        if (resolved.source == .default) {
-            std.debug.print("zlane: warning: default lane '{s}' is not usable; falling back to zig on PATH\n", .{resolved.name});
-            return try execPathFallback(io, gpa, env, argv0, args);
-        }
         return fatal(
             "lane '{s}' (from {s}) is not configured or has no zig executable; refusing to substitute another compiler (fix: zlane set {s} <dir>)",
             .{ resolved.name, switch (resolved.source) {
@@ -447,6 +475,7 @@ fn cli(io: Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "default")) {
+        std.debug.print("zlane: `default` is DEPRECATED and ignored — resolution is .ziglane-first (.ziglane > $ZIGUP_LANE > PATH); there is no machine-wide default\n", .{});
         if (args.len >= 2) {
             const lanes = try readLanes(io, gpa, env);
             if (findLane(lanes, args[1]) == null) return fatal("lane '{s}' is not configured", .{args[1]});
@@ -529,9 +558,9 @@ fn cli(io: Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
         \\  zlane path                just the resolved zig path
         \\  zlane doctor              diagnose the whole zig setup (lanes, PATH, env)
         \\
-        \\  `zig` resolution: $ZIGUP_LANE > .ziglane (cwd and ancestors) > default lane > PATH
-        \\  ($ZIGUP_LANE=path skips lanes; an explicit pin that is broken is an error,
-        \\   only unset/broken-default falls back to PATH)
+        \\  `zig` resolution: .ziglane (cwd and ancestors) > $ZIGUP_LANE > PATH
+        \\  (project-first, NO machine-wide default; $ZIGUP_LANE=path skips lanes;
+        \\   an explicit pin that is broken is an error, never a substitution)
         \\
     , .{});
     return 0;
@@ -579,12 +608,16 @@ fn captureVersion(io: Io, gpa: std.mem.Allocator, exe: []const u8) ?[]const u8 {
 
 /// Cheap content sniff: does this candidate look like a lane-shim binary
 /// rather than a real compiler? (searches the first 512 KiB for markers)
-fn smellsLikeShim(io: Io, gpa: std.mem.Allocator, exe: []const u8) bool {
-    const data = readFileSmall(io, gpa, exe, 16 << 20) orelse return false;
-    for ([_][]const u8{ "ZLANE_FALLBACK_ACTIVE", "zigup lane set" }) |marker| {
-        if (std.mem.indexOf(u8, data, marker) != null) return true;
-    }
-    return false;
+const ShimSmell = enum { not_a_shim, zlane, foreign };
+
+fn smellShim(io: Io, gpa: std.mem.Allocator, exe: []const u8) ShimSmell {
+    const data = readFileSmall(io, gpa, exe, 16 << 20) orelse return .not_a_shim;
+    // zlane binaries carry the guard-env marker; the old zigup fork carries
+    // its usage text. A zlane shim on PATH is fine (it chains correctly and
+    // is loop-guarded); a foreign one FAILs fallbacks.
+    if (std.mem.indexOf(u8, data, "ZLANE_FALLBACK_ACTIVE") != null) return .zlane;
+    if (std.mem.indexOf(u8, data, "zigup lane set") != null) return .foreign;
+    return .not_a_shim;
 }
 
 fn doctor(io: Io, gpa: std.mem.Allocator, env: *const process.Environ.Map, argv0: []const u8) !u8 {
@@ -626,26 +659,19 @@ fn doctor(io: Io, gpa: std.mem.Allocator, env: *const process.Environ.Map, argv0
         }
     }
 
-    // 3. default lane
-    if (try getDefaultLane(io, gpa, env)) |d| {
-        if (findLane(lanes, d) == null) {
-            fail("default lane '{s}' is not configured", .{d});
-        }
-    } else if (lanes.len > 0) {
-        warn("no default lane set (`zig` with no pin falls back to PATH)", .{});
+    // 3. legacy default-lane file (no longer part of resolution)
+    if (try getDefaultLane(io, gpa, env)) |_| {
+        std.debug.print("info  a legacy lane-default file exists — IGNORED (resolution is .ziglane-first; unpinned folders use PATH)\n", .{});
     }
 
     // 4. resolution trace (every source, winner marked)
     std.debug.print("info  resolution chain for `zig`:\n", .{});
+    if (findDotZiglane(io, gpa)) |pin| {
+        std.debug.print("info    .ziglane = '{s}' (project pin — wins)\n", .{pin});
+    } else std.debug.print("info    no .ziglane in cwd or ancestors\n", .{});
     if (env.get("ZIGUP_LANE")) |v| {
         std.debug.print("info    $ZIGUP_LANE = '{s}'\n", .{std.mem.trim(u8, v, " \r\n\t")});
     } else std.debug.print("info    $ZIGUP_LANE unset\n", .{});
-    if (findDotZiglane(io, gpa)) |pin| {
-        std.debug.print("info    .ziglane = '{s}' (project pin)\n", .{pin});
-    } else std.debug.print("info    no .ziglane in cwd or ancestors\n", .{});
-    if (try getDefaultLane(io, gpa, env)) |d| {
-        std.debug.print("info    default lane = '{s}'\n", .{d});
-    } else std.debug.print("info    no default lane\n", .{});
 
     const resolved = try resolveLane(io, gpa, env);
     var resolved_exe: ?[]const u8 = null;
@@ -701,18 +727,18 @@ fn doctor(io: Io, gpa: std.mem.Allocator, env: *const process.Environ.Map, argv0
                     continue;
                 }
             }
-            const shim = smellsLikeShim(io, gpa, candidate);
+            const smell = smellShim(io, gpa, candidate);
             if (first) {
-                if (shim) {
-                    fail("first zig on PATH is a lane shim: {s} (PATH fallback would dispatch through it — install a real zig ahead of it, or replace that shim)", .{candidate});
-                } else {
-                    ok("PATH fallback target: {s}{s}", .{ candidate, if (resolved_exe != null) " (unused while a lane resolves)" else "" });
+                switch (smell) {
+                    .foreign => fail("first zig on PATH is a FOREIGN lane shim: {s} (PATH fallback would dispatch through it and fail — install a real zig ahead of it, or replace that shim)", .{candidate}),
+                    .zlane => ok("PATH fallback target: {s} [a zlane shim — chains correctly]{s}", .{ candidate, if (resolved_exe != null) " (unused while a lane resolves)" else "" }),
+                    .not_a_shim => ok("PATH fallback target: {s}{s}", .{ candidate, if (resolved_exe != null) " (unused while a lane resolves)" else "" }),
                 }
                 first = false;
-            } else if (shim) {
-                warn("PATH contains a lane shim: {s}", .{candidate});
-            } else {
-                std.debug.print("info    {s}\n", .{candidate});
+            } else switch (smell) {
+                .foreign => warn("PATH contains a foreign lane shim: {s}", .{candidate}),
+                .zlane => std.debug.print("info    {s}   [zlane shim]\n", .{candidate}),
+                .not_a_shim => std.debug.print("info    {s}\n", .{candidate}),
             }
         }
         if (!found_any) {
