@@ -1342,8 +1342,14 @@ fn installCompiler(allocator: Allocator, compiler_dir: []const u8, url: []const 
             // note: important to close the file before we handle errors below
             //       since it will delete the parent directory of this file
             defer file.close(g_io);
-            var fw = file.writer(g_io, &.{});
-            break :blk download(allocator, url, &fw.interface);
+            // NOTE: a real, non-empty buffer matters — an empty-buffer writer
+            // pushed the http body streamer into a failure path that panics
+            // inside std's fetch (bodyErr().? on null) under load.
+            var fw_buf: [128 * 1024]u8 = undefined;
+            var fw = file.writerStreaming(g_io, &fw_buf);
+            const result = download(allocator, url, &fw.interface);
+            fw.interface.flush() catch {};
+            break :blk result;
         }) {
             .ok => {},
             .err => |err| {
