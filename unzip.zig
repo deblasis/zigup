@@ -1,5 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const process = std.process;
+const Io = std.Io;
 
 fn oom(e: error{OutOfMemory}) noreturn {
     @panic(@errorName(e));
@@ -10,77 +12,59 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 fn usage() noreturn {
-    std.io.getStdErr().writer().print("Usage: unzip [-d DIR] ZIP_FILE\n", .{}) catch |e| @panic(@errorName(e));
+    std.debug.print("Usage: unzip [-d DIR] ZIP_FILE\n", .{});
     std.process.exit(1);
 }
 
-var windows_args_arena = if (builtin.os.tag == .windows)
-    std.heap.ArenaAllocator.init(std.heap.page_allocator)
-else
-    struct {}{};
-pub fn cmdlineArgs() [][*:0]u8 {
-    if (builtin.os.tag == .windows) {
-        const slices = std.process.argsAlloc(windows_args_arena.allocator()) catch |err| switch (err) {
-            error.OutOfMemory => oom(error.OutOfMemory),
-            //error.InvalidCmdLine => @panic("InvalidCmdLine"),
-            error.Overflow => @panic("Overflow while parsing command line"),
-        };
-        const args = windows_args_arena.allocator().alloc([*:0]u8, slices.len - 1) catch |e| oom(e);
-        for (slices[1..], 0..) |slice, i| {
-            args[i] = slice.ptr;
-        }
-        return args;
-    }
-    return std.os.argv.ptr[1..std.os.argv.len];
-}
+pub fn main(init: process.Init) !void {
+    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const arena = arena_instance.allocator();
+    const io = init.io;
 
-pub fn main() !void {
     var cmdline_opt: struct {
-        dir_arg: ?[]u8 = null,
+        dir_arg: ?[]const u8 = null,
     } = .{};
 
-    const cmd_args = blk: {
-        const cmd_args = cmdlineArgs();
-        var arg_index: usize = 0;
-        var non_option_len: usize = 0;
-        while (arg_index < cmd_args.len) : (arg_index += 1) {
-            const arg = std.mem.span(cmd_args[arg_index]);
+    var non_option_args: std.ArrayList([]const u8) = .empty;
+    {
+        var it = try process.Args.Iterator.initAllocator(init.minimal.args, arena);
+        _ = it.next(); // argv[0]
+        while (it.next()) |arg| {
             if (!std.mem.startsWith(u8, arg, "-")) {
-                cmd_args[non_option_len] = arg;
-                non_option_len += 1;
+                try non_option_args.append(arena, arg);
             } else if (std.mem.eql(u8, arg, "-d")) {
-                arg_index += 1;
-                if (arg_index == cmd_args.len)
-                    fatal("option '{s}' requires an argument", .{arg});
-                cmdline_opt.dir_arg = std.mem.span(cmd_args[arg_index]);
+                const next = it.next() orelse fatal("option '{s}' requires an argument", .{arg});
+                cmdline_opt.dir_arg = next;
             } else {
                 fatal("unknown cmdline option '{s}'", .{arg});
             }
         }
-        break :blk cmd_args[0..non_option_len];
-    };
+    }
 
-    if (cmd_args.len != 1) usage();
-    const zip_file_arg = std.mem.span(cmd_args[0]);
+    if (non_option_args.items.len != 1) usage();
+    const zip_file_arg = non_option_args.items[0];
 
+    const cwd = Io.Dir.cwd();
     var out_dir = blk: {
         if (cmdline_opt.dir_arg) |dir| {
-            break :blk std.fs.cwd().openDir(dir, .{}) catch |err| switch (err) {
-                error.FileNotFound => {
-                    try std.fs.cwd().makePath(dir);
-                    break :blk try std.fs.cwd().openDir(dir, .{});
+            break :blk cwd.openDir(io, dir, .{}) catch |err| switch (err) {
+                error.FileNotFound => blk2: {
+                    try cwd.createDirPath(io, dir);
+                    break :blk2 try cwd.openDir(io, dir, .{});
                 },
                 else => fatal("failed to open output directory '{s}' with {s}", .{ dir, @errorName(err) }),
             };
         }
-        break :blk std.fs.cwd();
+        break :blk cwd;
     };
-    defer if (cmdline_opt.dir_arg) |_| out_dir.close();
+    defer if (cmdline_opt.dir_arg != null) out_dir.close(io);
 
-    const zip_file = std.fs.cwd().openFile(zip_file_arg, .{}) catch |err|
+    const zip_file = cwd.openFile(io, zip_file_arg, .{}) catch |err|
         fatal("open '{s}' failed: {s}", .{ zip_file_arg, @errorName(err) });
-    defer zip_file.close();
-    try std.zip.extract(out_dir, zip_file.seekableStream(), .{
+    defer zip_file.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    var fr = zip_file.reader(io, &buf);
+    try std.zip.extract(out_dir, &fr, .{
         .allow_backslashes = true,
     });
 }
