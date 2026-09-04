@@ -204,8 +204,10 @@ pub fn main(init: process.Init) !void {
                 else => continue,
             }
             if (std.mem.endsWith(u8, install_entry.name, ".installing")) {
-                // leftover from an interrupted/cancelled install; leave it
-                // (the next run's zigup deletes it before retrying)
+                // leftover from an interrupted/cancelled install — delete it
+                // so the env self-heals instead of poisoning dependent tests
+                std.log.info("deleting leftover '{s}'", .{install_entry.name});
+                try fixdeletetree.deleteTree(dir, io, install_entry.name);
                 continue;
             }
             if (containsCompiler(keep_compilers, install_entry.name)) {
@@ -357,3 +359,4 @@ fn copyEnvDir(
 
 // cache-buster
 // cache-buster 2
+// cache-buster 3

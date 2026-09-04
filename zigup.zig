@@ -1356,7 +1356,17 @@ fn installCompiler(allocator: Allocator, compiler_dir: []const u8, url: []const 
 
         if (std.mem.endsWith(u8, archive_basename, ".tar.xz")) {
             archive_root_dir = archive_basename[0 .. archive_basename.len - ".tar.xz".len];
-            _ = try run(allocator, &[_][]const u8{ "tar", "xf", archive_absolute, "-C", installing_dir });
+            switch (try run(allocator, &[_][]const u8{ "tar", "xf", archive_absolute, "-C", installing_dir })) {
+                .exited => |code| if (code != 0) {
+                    std.log.err("failed to extract '{s}' with tar, exit code {d}", .{ archive_absolute, code });
+                    try loggyDeleteTreeAbsolute(installing_dir);
+                    return error.AlreadyReported;
+                },
+                else => {
+                    try loggyDeleteTreeAbsolute(installing_dir);
+                    return error.AlreadyReported;
+                },
+            }
         } else {
             var recognized = false;
             if (builtin.os.tag == .windows) {
@@ -1371,7 +1381,7 @@ fn installCompiler(allocator: Allocator, compiler_dir: []const u8, url: []const 
                     var archive_file = try Io.Dir.openFileAbsolute(g_io, archive_absolute, .{});
                     defer archive_file.close(g_io);
                     var archive_buf: [64 * 1024]u8 = undefined;
-                    var archive_reader = archive_file.readerStreaming(g_io, &archive_buf);
+                    var archive_reader = archive_file.reader(g_io, &archive_buf);
                     try std.zip.extract(installing_dir_opened, &archive_reader, .{});
                     const dur = Io.Timestamp.durationTo(start, Io.Timestamp.now(g_io, .awake));
                     loginfo("extracted archive in {d:.2} s", .{@as(f32, @floatFromInt(dur.nanoseconds)) / @as(f32, @floatFromInt(std.time.ns_per_s))});
