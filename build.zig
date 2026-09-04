@@ -262,7 +262,10 @@ fn addTests(
         .name = "test-invalid-index-url",
         .argv = &.{ "fetch-index", "--index", "this-is-not-a-valid-url" },
         .checks = &.{
-            .{ .expect_stderr_match = "error: could not download 'this-is-not-a-valid-url': the URL is invalid (InvalidFormat)" },
+            // NOTE: expectation updated for the 0.16-final port — the old
+            // "the URL is invalid (InvalidFormat)" wording came from a
+            // long-gone std error rendering.
+            .{ .expect_stderr_match = "error: could not download 'this-is-not-a-valid-url': failed to download 'this-is-not-a-valid-url' with InvalidFormat" },
         },
     });
 

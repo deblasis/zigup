@@ -1,5 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const process = std.process;
+const Io = std.Io;
 
 const fixdeletetree = @import("fixdeletetree.zig");
 
@@ -9,21 +11,27 @@ fn compilersArg(arg: []const u8) []const u8 {
     return if (std.mem.eql(u8, arg, "--no-compilers")) "" else arg;
 }
 
-pub fn main() !void {
+pub fn main(init: process.Init) !void {
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = arena_instance.allocator();
-    const all_args = try std.process.argsAlloc(arena);
-    if (all_args.len < 7) @panic("not enough cmdline args");
+    const io = init.io;
 
-    const test_name = all_args[1];
-    const add_path_option = all_args[2];
-    const in_env_dir = all_args[3];
-    const with_compilers = compilersArg(all_args[4]);
-    const keep_compilers = compilersArg(all_args[5]);
-    const out_env_dir = all_args[6];
-    const setup_option = all_args[7];
-    const zigup_exe = all_args[8];
-    const zigup_args = all_args[9..];
+    var all_args: std.ArrayList([]const u8) = .empty;
+    {
+        var it = try process.Args.Iterator.initAllocator(init.minimal.args, arena);
+        while (it.next()) |a| try all_args.append(arena, a);
+    }
+    if (all_args.items.len < 9) @panic("not enough cmdline args");
+
+    const test_name = all_args.items[1];
+    const add_path_option = all_args.items[2];
+    const in_env_dir = all_args.items[3];
+    const with_compilers = compilersArg(all_args.items[4]);
+    const keep_compilers = compilersArg(all_args.items[5]);
+    const out_env_dir = all_args.items[6];
+    const setup_option = all_args.items[7];
+    const zigup_exe = all_args.items[8];
+    const zigup_args = all_args.items[9..];
 
     const add_path = blk: {
         if (std.mem.eql(u8, add_path_option, "--with-path")) break :blk true;
@@ -32,18 +40,12 @@ pub fn main() !void {
         std.process.exit(0xff);
     };
 
-    try fixdeletetree.deleteTree(std.fs.cwd(), out_env_dir);
-    try std.fs.cwd().makeDir(out_env_dir);
+    const cwd = Io.Dir.cwd();
+    cwd.deleteTree(io, out_env_dir) catch {};
+    try cwd.createDir(io, out_env_dir, .default_dir);
 
     // make a file named after the test so we can find this directory in the cache
     _ = test_name;
-    // {
-    //     const test_marker_file = try std.fs.path.join(arena, &.{ out_env_dir, test_name});
-    //     defer arena.free(test_marker_file);
-    //     var file = try std.fs.cwd().createFile(test_marker_file, .{});
-    //     defer file.close();
-    //     try file.writer().print("this file marks this directory as the output for test: {s}\n", .{test_name});
-    // }
 
     const appdata = try std.fs.path.join(arena, &.{ out_env_dir, "appdata" });
     const path_link = try std.fs.path.join(arena, &.{ out_env_dir, "zig" ++ exe_ext });
@@ -54,17 +56,19 @@ pub fn main() !void {
     };
 
     const install_dir_setting_path = try std.fs.path.join(arena, &.{ appdata, "install-dir" });
-    defer arena.free(install_dir_setting_path);
 
     if (std.mem.eql(u8, in_env_dir, "--no-input-environment")) {
-        try std.fs.cwd().makeDir(install_dir);
-        try std.fs.cwd().makeDir(appdata);
-        var file = try std.fs.cwd().createFile(install_dir_setting_path, .{});
-        defer file.close();
-        try file.writer().writeAll(install_dir);
+        try cwd.createDir(io, install_dir, .default_dir);
+        try cwd.createDir(io, appdata, .default_dir);
+        var file = try cwd.createFile(io, install_dir_setting_path, .{});
+        defer file.close(io);
+        var fw = file.writerStreaming(io, &.{});
+        try fw.interface.writeAll(install_dir);
+        try fw.interface.flush();
     } else {
         var shared_sibling_state: SharedSiblingState = .{};
         try copyEnvDir(
+            io,
             arena,
             in_env_dir,
             out_env_dir,
@@ -75,17 +79,20 @@ pub fn main() !void {
         );
 
         const input_install_dir = blk: {
-            var file = try std.fs.cwd().openFile(install_dir_setting_path, .{});
-            defer file.close();
-            break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
+            var file = try cwd.openFile(io, install_dir_setting_path, .{});
+            defer file.close(io);
+            var buf: [1]u8 = undefined;
+            var fr = file.reader(io, &buf);
+            break :blk try fr.interface.allocRemaining(arena, .limited(std.math.maxInt(u32)));
         };
-        defer arena.free(input_install_dir);
         switch (parseInstallDir(input_install_dir)) {
             .good => |input_install_dir_parsed| {
                 std.debug.assert(std.mem.eql(u8, install_dir_parsed.cache_o, input_install_dir_parsed.cache_o));
-                var file = try std.fs.cwd().createFile(install_dir_setting_path, .{});
-                defer file.close();
-                try file.writer().writeAll(install_dir);
+                var file = try cwd.createFile(io, install_dir_setting_path, .{ .truncate = true });
+                defer file.close(io);
+                var fw = file.writerStreaming(io, &.{});
+                try fw.interface.writeAll(install_dir);
+                try fw.interface.flush();
             },
             .bad => {
                 // the install dir must have been customized, keep it
@@ -98,97 +105,129 @@ pub fn main() !void {
     if (std.mem.eql(u8, setup_option, "no-extra-setup")) {
         // nothing extra to setup
     } else if (std.mem.eql(u8, setup_option, "path-link-is-directory")) {
-        std.fs.cwd().deleteFile(path_link) catch |err| switch (err) {
+        cwd.deleteFile(io, path_link) catch |err| switch (err) {
             error.FileNotFound => {},
             else => |e| return e,
         };
-        try std.fs.cwd().makeDir(path_link);
+        try cwd.createDir(io, path_link, .default_dir);
     } else if (std.mem.eql(u8, setup_option, "another-zig")) {
         maybe_second_bin_dir = try std.fs.path.join(arena, &.{ out_env_dir, "bin2" });
-        try std.fs.cwd().makeDir(maybe_second_bin_dir.?);
+        try cwd.createDir(io, maybe_second_bin_dir.?, .default_dir);
 
         const fake_zig = try std.fs.path.join(arena, &.{
             maybe_second_bin_dir.?,
             "zig" ++ comptime builtin.target.exeFileExt(),
         });
-        defer arena.free(fake_zig);
-        var file = try std.fs.cwd().createFile(fake_zig, .{});
-        defer file.close();
-        try file.writer().writeAll("a fake executable");
+        var file = try cwd.createFile(io, fake_zig, .{});
+        defer file.close(io);
+        var fw = file.writerStreaming(io, &.{});
+        try fw.interface.writeAll("a fake executable");
+        try fw.interface.flush();
     } else {
         std.log.err("unknown setup option '{s}'", .{setup_option});
         std.process.exit(0xff);
     }
 
-    var argv = std.ArrayList([]const u8).init(arena);
-    try argv.append(zigup_exe);
-    try argv.append("--appdata");
-    try argv.append(appdata);
-    try argv.append("--path-link");
-    try argv.append(path_link);
-    try argv.appendSlice(zigup_args);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(arena, zigup_exe);
+    try argv.append(arena, "--appdata");
+    try argv.append(arena, appdata);
+    try argv.append(arena, "--path-link");
+    try argv.append(arena, path_link);
+    try argv.appendSlice(arena, zigup_args);
 
-    if (true) {
-        try std.io.getStdErr().writer().writeAll("runtest exec: ");
+    {
+        var err_file = Io.File.stderr();
+        var buf: [512]u8 = undefined;
+        var w = err_file.writerStreaming(io, &buf);
+        try w.interface.writeAll("runtest exec:");
         for (argv.items) |arg| {
-            try std.io.getStdErr().writer().print(" {s}", .{arg});
+            try w.interface.print(" {s}", .{arg});
         }
-        try std.io.getStdErr().writer().writeAll("\n");
+        try w.interface.writeAll("\n");
+        try w.interface.flush();
     }
 
-    var child = std.process.Child.init(argv.items, arena);
-
     if (add_path) {
-        var env_map = try std.process.getEnvMap(arena);
         // make sure the directory with our path-link comes first in PATH
-        var new_path = std.ArrayList(u8).init(arena);
-        if (maybe_second_bin_dir) |second_bin_dir| {
-            try new_path.appendSlice(second_bin_dir);
-            try new_path.append(std.fs.path.delimiter);
+        var env_map = process.Environ.Map.init(arena);
+        for (init.environ_map.keys(), init.environ_map.values()) |key, value| {
+            try env_map.put(key, value);
         }
-        try new_path.appendSlice(out_env_dir);
-        try new_path.append(std.fs.path.delimiter);
+        var new_path: std.ArrayList(u8) = .empty;
+        if (maybe_second_bin_dir) |second_bin_dir| {
+            try new_path.appendSlice(arena, second_bin_dir);
+            try new_path.append(arena, std.fs.path.delimiter);
+        }
+        try new_path.appendSlice(arena, out_env_dir);
+        try new_path.append(arena, std.fs.path.delimiter);
         if (env_map.get("PATH")) |path| {
-            try new_path.appendSlice(path);
+            try new_path.appendSlice(arena, path);
         }
         try env_map.put("PATH", new_path.items);
-        child.env_map = &env_map;
-    } else if (maybe_second_bin_dir) |_| @panic("invalid config");
 
-    try child.spawn();
-    const result = try child.wait();
-    switch (result) {
-        .Exited => |c| if (c != 0) std.process.exit(c),
-        else => |sig| {
-            std.log.err("zigup terminated from '{s}' with {}", .{ @tagName(result), sig });
-            std.process.exit(0xff);
-        },
+        var child = try process.spawn(io, .{
+            .argv = argv.items,
+            .environ_map = &env_map,
+        });
+        const result = try child.wait(io);
+        switch (result) {
+            .exited => |c| if (c != 0) std.process.exit(c),
+            else => |sig| {
+                std.log.err("zigup terminated from '{s}' with {any}", .{ @tagName(result), sig });
+                std.process.exit(0xff);
+            },
+        }
+    } else {
+        if (maybe_second_bin_dir) |_| @panic("invalid config");
+        var child = try process.spawn(io, .{
+            .argv = argv.items,
+            .environ_map = null,
+        });
+        const result = try child.wait(io);
+        switch (result) {
+            .exited => |c| if (c != 0) std.process.exit(c),
+            else => |sig| {
+                std.log.err("zigup terminated from '{s}' with {any}", .{ @tagName(result), sig });
+                std.process.exit(0xff);
+            },
+        }
     }
 
     {
-        var dir = try std.fs.cwd().openDir(install_dir, .{ .iterate = true });
-        defer dir.close();
+        var dir = try cwd.openDir(io, install_dir, .{ .iterate = true });
+        defer dir.close(io);
         var it = dir.iterate();
-        while (try it.next()) |install_entry| {
+        while (try it.next(io)) |install_entry| {
             switch (install_entry.kind) {
                 .directory => {},
                 else => continue,
+            }
+            if (std.mem.endsWith(u8, install_entry.name, ".installing")) {
+                // leftover from an interrupted/cancelled install; leave it
+                // (the next run's zigup deletes it before retrying)
+                continue;
             }
             if (containsCompiler(keep_compilers, install_entry.name)) {
                 std.log.info("keeping compiler '{s}'", .{install_entry.name});
                 continue;
             }
             const files_path = try std.fs.path.join(arena, &.{ install_entry.name, "files" });
-            var files_dir = try dir.openDir(files_path, .{ .iterate = true });
-            defer files_dir.close();
+            // a compiler dir copied with --no-compilers has an empty (or,
+            // after partial copies, missing) files dir — nothing to clean
+            var files_dir = dir.openDir(io, files_path, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer files_dir.close(io);
             var files_it = files_dir.iterate();
             var is_first = true;
-            while (try files_it.next()) |files_entry| {
+            while (try files_it.next(io)) |files_entry| {
                 if (is_first) {
                     std.log.info("cleaning compiler '{s}'", .{install_entry.name});
                     is_first = false;
                 }
-                try fixdeletetree.deleteTree(files_dir, files_entry.name);
+                try fixdeletetree.deleteTree(files_dir, io, files_entry.name);
             }
         }
     }
@@ -227,7 +266,7 @@ fn containsCompiler(compilers: []const u8, compiler: []const u8) bool {
 }
 
 fn isCompilerFilesEntry(path: []const u8) ?[]const u8 {
-    var it = std.fs.path.NativeComponentIterator.init(path) catch std.debug.panic("invalid path '{s}'", .{path});
+    var it = std.fs.path.NativeComponentIterator.init(path);
     {
         const name = (it.next() orelse return null).name;
         if (!std.mem.eql(u8, name, "install")) return null;
@@ -244,6 +283,7 @@ const SharedSiblingState = struct {
     logged: bool = false,
 };
 fn copyEnvDir(
+    io: Io,
     allocator: std.mem.Allocator,
     in_root: []const u8,
     out_root: []const u8,
@@ -260,7 +300,7 @@ fn copyEnvDir(
             .windows => "\\/",
             else => "/",
         };
-        const relative = std.mem.trimLeft(u8, in_path[in_root.len..], separators);
+        const relative = std.mem.trimStart(u8, in_path[in_root.len..], separators);
         if (isCompilerFilesEntry(relative)) |compiler| {
             const exclude = !containsCompiler(opt.with_compilers, compiler);
             if (!shared_sibling_state.logged) {
@@ -271,25 +311,25 @@ fn copyEnvDir(
         }
     }
 
-    var in_dir = try std.fs.cwd().openDir(in_path, .{ .iterate = true });
-    defer in_dir.close();
+    const cwd = Io.Dir.cwd();
+    var in_dir = try cwd.openDir(io, in_path, .{ .iterate = true });
+    defer in_dir.close(io);
 
     var it = in_dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         const in_sub_path = try std.fs.path.join(allocator, &.{ in_path, entry.name });
-        defer allocator.free(in_sub_path);
         const out_sub_path = try std.fs.path.join(allocator, &.{ out_path, entry.name });
-        defer allocator.free(out_sub_path);
         switch (entry.kind) {
             .directory => {
-                try std.fs.cwd().makeDir(out_sub_path);
+                try cwd.createDir(io, out_sub_path, .default_dir);
                 var shared_child_state: SharedSiblingState = .{};
-                try copyEnvDir(allocator, in_root, out_root, in_sub_path, out_sub_path, opt, &shared_child_state);
+                try copyEnvDir(io, allocator, in_root, out_root, in_sub_path, out_sub_path, opt, &shared_child_state);
             },
-            .file => try std.fs.cwd().copyFile(in_sub_path, std.fs.cwd(), out_sub_path, .{}),
+            .file => try cwd.copyFile(in_sub_path, cwd, out_sub_path, io, .{}),
             .sym_link => {
                 var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const in_target = try std.fs.cwd().readLink(in_sub_path, &target_buf);
+                const in_len = try cwd.readLink(io, in_sub_path, &target_buf);
+                const in_target = target_buf[0..in_len];
                 var out_target_buf: [std.fs.max_path_bytes]u8 = undefined;
                 const out_target = blk: {
                     if (std.fs.path.isAbsolute(in_target)) {
@@ -308,9 +348,12 @@ fn copyEnvDir(
 
                 if (builtin.os.tag == .windows) @panic(
                     "we got a symlink on windows?",
-                ) else try std.posix.symlink(out_target, out_sub_path);
+                ) else try cwd.symLink(io, out_target, out_sub_path, .{});
             },
             else => std.debug.panic("copy {}", .{entry}),
         }
     }
 }
+
+// cache-buster
+// cache-buster 2

@@ -139,11 +139,12 @@ ZIGUP_LANE=nosuch "$ZIGUP" which > "$S/out8" 2>&1; rc8=$?
 check "which broken pin" "HARD ERROR" "$(cat "$S/out8")"
 [[ $rc8 -ne 0 ]] && print -r -- "ok   which broken pin nonzero exit" || { print -r -- "FAIL which broken rc=0"; FAILS=$((FAILS+1)); }
 
-# --- 9. `zigup run` acts as the zig shim (no installed pool compilers here)
-ZIGUP_LANE=laneA "$ZIGUP" run version > "$S/out9" 2>&1
-check "zigup run = zig shim" "laneA-1.0.0" "$(cat "$S/out9")"
-# ...and stock `run VERSION` still works when VERSION is installed (tested
-# separately with the real pool in battery-run-pool.sh)
+# --- 9. `zigup lane run` acts as the zig shim; top-level `run` is stock
+ZIGUP_LANE=laneA "$ZIGUP" lane run version > "$S/out9" 2>&1
+check "zigup lane run = zig shim" "laneA-1.0.0" "$(cat "$S/out9")"
+ZIGUP_LANE=laneA "$ZIGUP" run doesnotexist version > "$S/out9b" 2>&1; rc9b=$?
+check "stock zigup run errors on unknown version" "fetch it first with: zigup fetch doesnotexist" "$(cat "$S/out9b")"
+[[ $rc9b -ne 0 ]] && print -r -- "ok   stock run nonzero exit" || { print -r -- "FAIL stock run rc=0"; FAILS=$((FAILS+1)); }
 
 # --- 10. legacy default lane is ignored by resolution
 "$ZIGUP" lane default laneB > "$S/out10" 2>&1
@@ -159,7 +160,7 @@ check "no default guessing" "no lane resolved and no zig found on PATH" "$(cat "
 "$ZIGUP" lane help > "$S/out11" 2>&1 || true
 "$ZIGUP" lane > "$S/out11" 2>&1 || true
 check "usage branded zigup" "zigup — the zig lane resolver" "$(cat "$S/out11")"
-check "usage run alias" "run [args...]" "$(cat "$S/out11")"
+check "usage run alias" "lane run [args...]" "$(cat "$S/out11")"
 "$ZIGUP" --help > "$S/out11b" 2>&1
 check "main help mentions lanes" ".ziglane" "$(cat "$S/out11b")"
 

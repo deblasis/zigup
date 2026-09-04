@@ -302,7 +302,6 @@ fn help(allocator: Allocator) !void {
         \\                                that aren't the default, master, or marked to keep.
         \\  zigup keep VERSION            mark a compiler to be kept during clean
         \\  zigup run VERSION ARGS...     run the given VERSION of the compiler with the given ARGS...
-        \\                                (with no installed VERSION, `run` acts as the `zig` shim instead)
         \\
         \\Lanes (multiple named compiler lines on one machine):
         \\
@@ -310,10 +309,9 @@ fn help(allocator: Allocator) !void {
         \\  zigup lane list               list lanes
         \\  zigup lane remove <name>      remove a lane
         \\  zigup lane shim [name]...     install lane shims (incl. `zig`) next to zigup
+        \\  zigup lane run [args...]      act as the `zig` shim
         \\  zigup which | path            what `zig` resolves to, and why
         \\  zigup doctor                  diagnose the whole zig setup (lanes, PATH, env)
-        \\  zigup run [args...]           act as the `zig` shim (when args[0] is not an
-        \\                                installed compiler version)
         \\
         \\                                `zig` resolution: ./.ziglane (cwd and ancestors)
         \\                                  > $ZIGUP_LANE > zig on PATH (project-first, NO
@@ -577,17 +575,11 @@ pub fn main2(allocator: Allocator, args_array: []const []const u8) !u8 {
     return 1;
 }
 
-/// `zigup run ...` — stock behavior (run an installed VERSION from the
-/// zigup pool) when the first word names an installed compiler; otherwise
-/// exactly what the `zig` shim would do (lane resolution).
+/// `zigup run VERSION PROG ARGS...` — stock behavior (run an installed
+/// VERSION from the zigup pool). The zlane-style "act as the `zig` shim"
+/// alias lives at `zigup lane run`.
 fn runSubcommand(allocator: Allocator, rest: []const []const u8) !u8 {
-    if (rest.len >= 1) {
-        if (getInstallDir(allocator, .{ .create = false, .log = false })) |install_dir_string| {
-            const compiler_dir = try std.fs.path.join(allocator, &[_][]const u8{ install_dir_string, rest[0] });
-            if (existsAbsolute(compiler_dir) catch false) return try runCompiler(allocator, rest);
-        } else |_| {}
-    }
-    return try lanes.runAsZig(g_lane_ctx, rest);
+    return try runCompiler(allocator, rest);
 }
 
 /// 0.16-final removed std.os.windows.WSAStartup; the new Io uses NTDLL

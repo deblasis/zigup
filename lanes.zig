@@ -530,7 +530,7 @@ fn usage(ctx: Ctx) void {
         \\  {s} which                  what `zig` resolves to, and why
         \\  {s} path                   just the resolved zig path
         \\  {s} doctor                 diagnose the whole zig setup (lanes, PATH, env)
-        \\  {s} run [args...]          act as the `zig` shim
+        \\  {s} lane run [args...]      act as the `zig` shim
         \\
         \\  `zig` resolution: .ziglane (cwd and ancestors) > $ZIGUP_LANE > PATH
         \\  (project-first, NO machine-wide default; $ZIGUP_LANE=path skips lanes;
