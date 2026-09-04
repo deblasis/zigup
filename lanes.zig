@@ -271,8 +271,10 @@ fn findDotZiglane(ctx: Ctx) ?[]const u8 {
         const candidate = std.fs.path.join(ctx.gpa, &.{ dir, ".ziglane" }) catch return null;
         if (readFileSmall(ctx, candidate, 4096)) |data| {
             const trimmed = std.mem.trim(u8, data, " \r\n\t");
-            if (trimmed.len == 0) return null;
-            return trimmed;
+            // An EMPTY marker is not a pin: keep walking so a nested
+            // project inherits the ancestor's lane, and only a tree with
+            // no non-empty marker anywhere defers to $ZIGUP_LANE/PATH.
+            if (trimmed.len > 0) return trimmed;
         }
         const parent = dirnameOf(dir) orelse return null;
         if (std.mem.eql(u8, parent, dir)) return null;
