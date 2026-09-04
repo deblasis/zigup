@@ -56,6 +56,7 @@ const Resolved = struct { name: []const u8, source: Source };
 var init_environ: *const process.Environ.Map = undefined;
 var init_args: process.Args = undefined;
 var init_argv0: []const u8 = "";
+var init_prog: []const u8 = "zlane";
 
 pub fn main(init: process.Init) !u8 {
     // Arena over page memory: a short-lived CLI that never frees
@@ -69,6 +70,7 @@ pub fn main(init: process.Init) !u8 {
     var it = try process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     const argv0 = it.next() orelse return fatal("no argv[0]", .{});
     init_argv0 = argv0;
+    init_prog = basenameNoExe(argv0);
     var args = std.ArrayList([]const u8).empty;
     while (it.next()) |a| try args.append(gpa, a);
 
@@ -95,7 +97,8 @@ pub fn main(init: process.Init) !u8 {
 }
 
 fn fatal(comptime fmt: []const u8, fmt_args: anytype) u8 {
-    std.debug.print("zlane: " ++ fmt ++ "\n", fmt_args);
+    std.debug.print("{s}: ", .{init_prog});
+    std.debug.print(fmt ++ "\n", fmt_args);
     return 0xff;
 }
 
@@ -475,7 +478,7 @@ fn cli(io: Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "default")) {
-        std.debug.print("zlane: `default` is DEPRECATED and ignored — resolution is .ziglane-first (.ziglane > $ZIGUP_LANE > PATH); there is no machine-wide default\n", .{});
+        std.debug.print("{s}: `default` is DEPRECATED and ignored — resolution is .ziglane-first (.ziglane > $ZIGUP_LANE > PATH); there is no machine-wide default\n", .{init_prog});
         if (args.len >= 2) {
             const lanes = try readLanes(io, gpa, env);
             if (findLane(lanes, args[1]) == null) return fatal("lane '{s}' is not configured", .{args[1]});
@@ -547,22 +550,23 @@ fn cli(io: Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
     }
 
     std.debug.print(
-        \\zlane — the zig lane resolver
+        \\{s} — the zig lane resolver
         \\
-        \\  zlane set <name> <dir>    register a lane (validates the zig executable)
-        \\  zlane remove <name>
-        \\  zlane list
-        \\  zlane default [name]
-        \\  zlane shim [names...]     install shims next to this binary (default: zig + all lanes)
-        \\  zlane which               what `zig` resolves to, and why
-        \\  zlane path                just the resolved zig path
-        \\  zlane doctor              diagnose the whole zig setup (lanes, PATH, env)
+        \\  {s} set <name> <dir>     register a lane (validates the zig executable)
+        \\  {s} remove <name>
+        \\  {s} list
+        \\  {s} default [name]       DEPRECATED: ignored (resolution is .ziglane-first)
+        \\  {s} shim [names...]      install shims next to this binary (default: zig + all lanes)
+        \\  {s} which                what `zig` resolves to, and why
+        \\  {s} path                 just the resolved zig path
+        \\  {s} doctor               diagnose the whole zig setup (lanes, PATH, env)
+        \\  {s} run [args...]        act as the `zig` shim
         \\
         \\  `zig` resolution: .ziglane (cwd and ancestors) > $ZIGUP_LANE > PATH
         \\  (project-first, NO machine-wide default; $ZIGUP_LANE=path skips lanes;
         \\   an explicit pin that is broken is an error, never a substitution)
         \\
-    , .{});
+    , .{ init_prog, init_prog, init_prog, init_prog, init_prog, init_prog, init_prog, init_prog, init_prog, init_prog });
     return 0;
 }
 
@@ -622,7 +626,7 @@ fn smellShim(io: Io, gpa: std.mem.Allocator, exe: []const u8) ShimSmell {
 
 fn doctor(io: Io, gpa: std.mem.Allocator, env: *const process.Environ.Map, argv0: []const u8) !u8 {
     doctor_failures = 0;
-    std.debug.print("zlane doctor\n==========\n", .{});
+    std.debug.print("{s} doctor\n==========\n", .{init_prog});
 
     // 1. this binary
     const self_abs = selfPathAbs(io, gpa, argv0);
