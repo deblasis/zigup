@@ -130,6 +130,15 @@ fn dirnameOf(p: []const u8) ?[]const u8 {
 /// selfExe API); the PATH fallback also carries a loop guard for the cases
 /// argv[0] lies.
 fn selfDir(ctx: Ctx) ?[]const u8 {
+    // A BARE argv0 (cmd.exe passes "zig" as typed, not the resolved path)
+    // would anchor on the cwd and make PATH self-exclusion miss the shim's
+    // real directory — the fallback would find itself. Resolve a basename-
+    // only argv0 against PATH first, exactly as the invoking shell did.
+    if (std.fs.path.dirname(ctx.argv0) == null) {
+        if (findOnPath(ctx, ctx.argv0)) |hit| {
+            return trimTrailingSep(dirnameOf(hit) orelse return null);
+        }
+    }
     // NOTE: fs.path.resolve can return a RELATIVE path when fed relative
     // inputs (resolve(".", "./x") -> "x") — anchor on the cwd so the result
     // is absolute, or PATH self-exclusion silently fails.
@@ -139,6 +148,25 @@ fn selfDir(ctx: Ctx) ?[]const u8 {
     else
         std.fs.path.resolve(ctx.gpa, &.{ cwd, ctx.argv0 }) catch return null;
     return trimTrailingSep(dirnameOf(abs) orelse return null);
+}
+
+/// First hit for `name` (with the platform exe extension) on PATH.
+fn findOnPath(ctx: Ctx, name: []const u8) ?[]const u8 {
+    const path_var = ctx.env.get("PATH") orelse return null;
+    const with_ext = if (windows_host and !std.mem.endsWith(u8, name, ".exe"))
+        std.fmt.allocPrint(ctx.gpa, "{s}.exe", .{name}) catch return null
+    else
+        name;
+    const sep: u8 = if (windows_host) ';' else ':';
+    var entries = std.mem.splitScalar(u8, path_var, sep);
+    while (entries.next()) |entry_raw| {
+        const entry = trimTrailingSep(std.mem.trim(u8, entry_raw, " \""));
+        if (entry.len == 0) continue;
+        const candidate = std.fs.path.join(ctx.gpa, &.{ entry, with_ext }) catch continue;
+        Io.Dir.cwd().access(ctx.io, candidate, .{}) catch continue;
+        return candidate;
+    }
+    return null;
 }
 
 /// argv0 made absolute (reads through the cwd handle choke on relative
